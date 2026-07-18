@@ -24,6 +24,7 @@ WARD_PATTERNS = [
     ("khánh hội", "Phường Khánh Hội"),
     ("xóm chiếu", "Phường Xóm Chiếu"),
     ("vĩnh hội", "Phường Vĩnh Hội"),
+    ("vình hội", "Phường Vĩnh Hội"),  # common typo in source lists
     ("bình đông", "Phường Bình Đông"),
     ("an lạc", "Phường An Lạc"),
     ("chợ quán", "Phường Chợ Quán"),
@@ -70,20 +71,32 @@ def _fold(text: str) -> str:
 # Ordered: more specific tokens first so "cccd me" wins over "cccd".
 _HEADER_TOKENS = [
     ("cccd me", "mother_cccd"),
+    ("cccd cua me", "mother_cccd"),
+    ("cccd nguoi giam ho", "mother_cccd"),
+    ("cccd cua nguoi giam ho", "mother_cccd"),
     ("ma dinh danh me", "mother_cccd"),
     ("ho ten me", "mother_name"),
     ("ten me", "mother_name"),
+    ("nguoi giam ho", "mother_name"),
+    ("dia chi noi hoc", "school_address"),
+    ("dia chi noi lam viec", "school_address"),
+    ("dia chi truong", "school_address"),
     ("phuong/xa cua truong", "school_ward"),
     ("phuong xa cua truong", "school_ward"),
     ("phuong/xa truong", "school_ward"),
-    ("dia chi truong", "school_address"),
+    ("noi hoc/noi lam viec", "school_ward"),
+    ("noi hoc noi lam viec", "school_ward"),
+    ("noi dang theo hoc", "school_name"),
+    ("noi dang lam viec", "school_name"),
     ("ten truong", "school_name"),
     ("dia chi", "address"),
     ("phuong", "ward"),
     ("xa", "ward"),
+    ("ho va ten", "child_name"),
     ("ho ten", "child_name"),
     ("ten tre", "child_name"),
     ("gioi tinh", "gender"),
+    ("ngay thang nam sinh", "dob"),
     ("ngay sinh", "dob"),
     ("cccd", "child_cccd"),
     ("ma dinh danh", "child_cccd"),
@@ -150,6 +163,7 @@ def _finish_record(raw: Dict, tt_fallback: int) -> Dict:
     }
     ward = str(raw.get("ward") or "").strip()
     rec["ward"] = ward or extract_ward(rec["address"])
+    rec["school_ward"] = rec["school_ward"] or extract_ward(rec["school_address"]) or ""
     # Excel keeps leading zeros only in text cells; phone numbers start with 0.
     if rec["phone"] and not rec["phone"].startswith("0"):
         rec["phone"] = "0" + rec["phone"]
@@ -188,9 +202,15 @@ def parse_excel(path: str) -> List[Dict]:
     records = []
     for row in rows[header_idx + 1:]:
         raw = {key: row[col] if col < len(row) else None for key, col in mapping.items()}
-        if not str(raw.get("child_name") or "").strip():
+        child_name = str(raw.get("child_name") or "").strip()
+        if not child_name or not any(ch.isalpha() for ch in child_name):
             continue  # blank / spacer row
         records.append(_finish_record(raw, tt_fallback=len(records) + 1))
+    if not records:
+        raise SystemExit(
+            "Không đọc được dòng học sinh nào từ file Excel này.\n"
+            "Kiểm tra lại dòng tiêu đề có cột Họ tên/Họ và tên, Giới tính, Ngày sinh."
+        )
     return records
 
 
