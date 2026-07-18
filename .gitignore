@@ -4,7 +4,9 @@ dist/
 *.spec.bak
 
 # Runtime files created next to the executable
+chrome-profile/
 firefox-profile/
+browser-cache/
 .playwright-firefox-profile/
 import_results.json
 children.json

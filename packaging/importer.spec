@@ -2,38 +2,33 @@
 # Run from the repo root so the relative paths below resolve.
 #
 # Produces a single self-contained executable (medinet-importer[.exe]) with the
-# Python runtime, Playwright and a full Firefox baked in -- nothing to install on
-# the target machine. Build it once per OS (PyInstaller cannot cross-compile);
-# see .github/workflows/build.yml for the Windows/macOS/Linux matrix.
+# Python runtime and Playwright's node driver inside. It drives the user's own
+# installed Chrome or Firefox, so NO browser binary is bundled -- the executable
+# stays small. Build once per OS (PyInstaller cannot cross-compile); see
+# .github/workflows/build.yml for the Windows/macOS/Linux matrix.
 
+import glob
 import os
-import shutil
 
 import playwright
 
 # Paths in a spec resolve against the spec's own folder (SPECPATH), not the CWD.
-# Everything below is relative to the repo root, one level up.
 ROOT = os.path.dirname(SPECPATH)
 
-# PyInstaller's bundled playwright hook collects the whole package including the
-# browsers on its own, so we start empty and strip the browsers back out after
-# Analysis (see below) rather than trying to out-vote that hook here.
+# Start empty; PyInstaller's bundled playwright hook collects the package (its
+# node driver included) during Analysis.
 datas = []
 binaries = []
 hiddenimports = []
 
-# Ship the whole browser as one .tar.gz. tar preserves the executable bits and
-# the symlinks inside Firefox's .app that a plain file copy (or zip) would lose,
-# and keeping it as an opaque archive avoids PyInstaller's dylib rpath rewrite
-# (which fails on Firefox's .dylibs). The runtime hook unpacks it on first launch.
+# The bundled hook misses the node driver's package.json files, so the driver dies
+# with "Cannot find module './../../package.json'" when it reads its own version.
+# Add every package.json under the driver (skipping the browsers we do not ship).
 pw_root = os.path.dirname(playwright.__file__)
-browsers_root = os.path.join(pw_root, "driver", "package", ".local-browsers")
-assets_dir = os.path.join(ROOT, "build", "assets")
-os.makedirs(assets_dir, exist_ok=True)
-archive = shutil.make_archive(
-    os.path.join(assets_dir, "pw-browsers"), "gztar", root_dir=browsers_root
-)
-datas.append((archive, "."))  # -> pw-browsers.tar.gz at the bundle root
+for pj in glob.glob(os.path.join(pw_root, "driver", "**", "package.json"), recursive=True):
+    if ".local-browsers" in pj.replace("\\", "/"):
+        continue
+    datas.append((pj, os.path.join("playwright", os.path.relpath(os.path.dirname(pj), pw_root))))
 
 # The sample list, seeded next to the executable on first run (see load_records()).
 datas.append((os.path.join(ROOT, "app", "data", "children.json"), "data"))
@@ -47,14 +42,14 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[os.path.join(ROOT, "packaging", "pyi_rth_playwright.py")],
+    runtime_hooks=[],
     excludes=[],
     cipher=block_cipher,
 )
 
-# Drop the raw browser tree the bundled playwright hook pulled in. PyInstaller
-# would otherwise try to rewrite the rpaths of Firefox's .dylibs and fail. The
-# browser reaches the app through pw-browsers.tar.gz instead (added above).
+# Safety net: if a Playwright browser was ever installed into the package, drop it.
+# We never drive a bundled browser, and PyInstaller chokes trying to rewrite the
+# rpaths of Firefox's .dylibs ("load commands do not fit").
 def _no_browsers(entry):
     return ".local-browsers" not in entry[0].replace("\\", "/")
 
@@ -68,7 +63,10 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,
-    [],
+    # 'u' = unbuffered stdio. The frozen bootloader ignores PYTHONUNBUFFERED, and
+    # with buffered stdio the user sees no output at all (even the "please log in"
+    # prompt), which reads as the app not launching.
+    [("u", None, "OPTION")],
     name="medinet-importer",
     debug=False,
     bootloader_ignore_signals=False,

@@ -10,15 +10,20 @@ anyone already present; it never edits or deletes an existing record.
 The Firefox profile is persisted in .playwright-firefox-profile/ so the medinet
 login survives between runs.
 
-It drives the user's own installed browser -- Chrome (via Playwright's chrome
-channel) or Firefox (via Marionette, Mozilla's built-in automation protocol) --
-with a dedicated profile kept beside the app, so the medinet login is entered
-once and remembered. Nothing is downloaded onto the target machine; it only needs
-Chrome or Firefox already installed.
+It drives the user's own everyday browser, existing medinet login included:
+  - Chrome on macOS: over AppleScript, in their real profile (Chrome 136+ blocks
+    CDP automation of the default profile, so AppleScript is the only route).
+  - Firefox everywhere: over Marionette in their default profile (Firefox must be
+    closed when the tool starts).
+  - --separate-profile switches to an isolated profile beside the app instead
+    (Playwright for Chrome/Edge -- also the Chrome path on Windows/Linux, where
+    the real profile cannot be automated at all).
+Nothing is downloaded onto the target machine; it only needs Chrome or Firefox.
 
 Usage (source):
-    python3 -m app.importer                      # import with Chrome (default)
-    python3 -m app.importer --browser firefox    # import with Firefox
+    python3 -m app.importer                      # Chrome, your real profile (macOS)
+    python3 -m app.importer --browser firefox    # Firefox, your real profile
+    python3 -m app.importer --separate-profile   # isolated profile, log in once
     python3 -m app.importer --dry-run            # fill forms but never save
     python3 -m app.importer --limit 3            # first 3 eligible records
 
@@ -41,8 +46,10 @@ from typing import Dict, List, Optional
 # stdlib Marionette) works even where Playwright is not installed.
 try:
     from app.marionette import DEFAULT_HOST, DEFAULT_PORT, Marionette, MarionetteError
+    from app import parsers
 except ImportError:  # frozen / run as a loose script, no package parent
     from marionette import DEFAULT_HOST, DEFAULT_PORT, Marionette, MarionetteError
+    import parsers
 
 ROOT_URL = "https://quanlyskcd.medinet.org.vn/"
 
@@ -147,7 +154,7 @@ class Importer:
                 return True
             if not prompted:
                 print("\n" + "=" * 68)
-                print("  Please log in to quanlyskcd.medinet.org.vn in the Firefox window.")
+                print("  Please log in to quanlyskcd.medinet.org.vn in the browser window.")
                 print("  Navigate to: Khám sức khỏe trẻ em -> Thông tin hành chính")
                 print("  The import starts automatically once the grid appears.")
                 print("=" * 68 + "\n")
@@ -170,7 +177,7 @@ class Importer:
         self.goto(ROOT_URL)
         for _ in range(30):
             time.sleep(1.0)
-            if self.run_js("document.body.innerText.trim().length") > 50:
+            if (self.run_js("document.body.innerText.trim().length") or 0) > 50:
                 break
         self.goto(LIST_URL)
         return self.wait_for_grid(timeout_s)
@@ -629,30 +636,52 @@ def parse_args() -> argparse.Namespace:
         default="chrome",
         help="which installed browser to drive (default: chrome)",
     )
+    parser.add_argument(
+        "--file",
+        help="children list to import: .xlsx, .pdf or .json (default: children.json beside the app)",
+    )
+    parser.add_argument(
+        "--make-template",
+        action="store_true",
+        help="write mau_danh_sach.xlsx beside the app and exit",
+    )
     parser.add_argument("--dry-run", action="store_true", help="fill forms but never save")
     parser.add_argument("--limit", type=int, help="only process the first N eligible records")
+    parser.add_argument(
+        "--separate-profile",
+        action="store_true",
+        help="use an isolated browser profile beside the app instead of your real one",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="check the packaging and installed browsers without opening any window",
+    )
     return parser.parse_args()
 
 
-def load_records(limit: Optional[int] = None, dry_run: bool = False):
-    """Split the parsed PDF rows into importable records and ones missing a ward."""
-    if not os.path.exists(DATA_FILE) and os.path.exists(BUNDLED_SAMPLE):
-        shutil.copyfile(BUNDLED_SAMPLE, DATA_FILE)
-        print(f"Created {DATA_FILE} from the bundled sample -- edit it to import your own list.")
-    if not os.path.exists(DATA_FILE):
-        raise SystemExit(f"ERROR: no data file at {DATA_FILE}. Put your children.json there.")
+def load_records(limit: Optional[int] = None, dry_run: bool = False,
+                 path: Optional[str] = None):
+    """Load the children list (xlsx/pdf/json) and split off rows missing a ward."""
+    if path is None:
+        if not os.path.exists(DATA_FILE) and os.path.exists(BUNDLED_SAMPLE):
+            shutil.copyfile(BUNDLED_SAMPLE, DATA_FILE)
+            print(f"Đã tạo {DATA_FILE} từ dữ liệu mẫu -- sửa lại theo danh sách của bạn.")
+        if not os.path.exists(DATA_FILE):
+            raise SystemExit(f"ERROR: không thấy file dữ liệu {DATA_FILE}.")
+        path = DATA_FILE
 
-    with open(DATA_FILE, encoding="utf-8") as f:
-        data: List[Dict] = json.load(f)
+    print(f"Đọc danh sách từ: {path}")
+    data: List[Dict] = parsers.load_any(path)
 
     no_ward = [r for r in data if not r.get("ward")]
     eligible = [r for r in data if r.get("ward")]
     if limit:
         eligible = eligible[:limit]
 
-    print(f"Loaded {len(data)} records: {len(eligible)} to process, {len(no_ward)} skipped (no ward).")
+    print(f"Đọc được {len(data)} hồ sơ: {len(eligible)} sẽ xử lý, {len(no_ward)} bỏ qua (thiếu Phường/Xã).")
     if dry_run:
-        print("*** DRY RUN: nothing will be saved ***")
+        print("*** CHẠY THỬ: sẽ không lưu gì ***")
     return eligible, no_ward
 
 
@@ -788,6 +817,123 @@ class MarionetteImporter(Importer):
             print("  ERROR: could not click Lưu")
 
 
+class AppleScriptJSDisabled(RuntimeError):
+    """Chrome refused to run JS: 'Allow JavaScript from Apple Events' is off."""
+
+
+class AppleScriptImporter(Importer):
+    """Drives the user's real, everyday Chrome on macOS over AppleScript.
+
+    This is the only way to automate the real Chrome profile (with its existing
+    medinet login): Chrome 136+ refuses CDP/Playwright automation of the default
+    profile, but still honours 'execute javascript' from Apple Events once the
+    user enables View > Developer > Allow JavaScript from Apple Events.
+    """
+
+    SITE = "quanlyskcd.medinet.org.vn"
+
+    def __init__(self, dry_run: bool = False):
+        super().__init__(page=None, dry_run=dry_run)
+        self._prompted_js_setting = False
+
+    @staticmethod
+    def _osascript(script: str) -> "subprocess.CompletedProcess":
+        return subprocess.run(
+            ["osascript", "-"], input=script, capture_output=True, text=True
+        )
+
+    @staticmethod
+    def _as_string(value: str) -> str:
+        """Escape a Python string into an AppleScript string literal."""
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+    def goto(self, url: str) -> None:
+        """Point the medinet tab (or a new tab) at url in the user's own Chrome."""
+        self._osascript(f"""
+tell application "Google Chrome"
+    activate
+    if (count of windows) = 0 then make new window
+    set found to false
+    repeat with w in windows
+        repeat with t in tabs of w
+            if URL of t contains "{self.SITE}" then
+                set URL of t to {self._as_string(url)}
+                set found to true
+                exit repeat
+            end if
+        end repeat
+        if found then exit repeat
+    end repeat
+    if not found then
+        tell front window to make new tab with properties {{URL:{self._as_string(url)}}}
+    end if
+end tell
+""")
+
+    def run_js(self, code: str):
+        """Evaluate a JS expression in the medinet tab and JSON-decode the result.
+
+        Everything goes through JSON.stringify so dicts/bools/numbers come back as
+        real Python values, matching what page.evaluate() gives the shared Importer.
+        """
+        js = f"JSON.stringify(( {code} ))"
+        script = f"""
+tell application "Google Chrome"
+    repeat with w in windows
+        repeat with t in tabs of w
+            if URL of t contains "{self.SITE}" then
+                return execute t javascript {self._as_string(js)}
+            end if
+        end repeat
+    end repeat
+    return "__no_tab__"
+end tell
+"""
+        proc = self._osascript(script)
+        err = (proc.stderr or "").strip()
+        if err and ("javascript" in err.lower() and ("turned off" in err.lower() or "apple events" in err.lower())):
+            raise AppleScriptJSDisabled(err)
+        out = (proc.stdout or "").strip()
+        if out in ("", "__no_tab__", "missing value", "undefined"):
+            return None
+        try:
+            return json.loads(out)
+        except ValueError:
+            return out
+
+    def wait_for_js_permission(self, timeout_s: int = 600) -> bool:
+        """Poll until Chrome lets Apple Events run JS, guiding the user to enable it."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                self.run_js("1 + 1")
+                return True
+            except AppleScriptJSDisabled:
+                if not self._prompted_js_setting:
+                    print("\n" + "=" * 68)
+                    print("  Chrome đang chặn điều khiển tự động. Bật một lần như sau:")
+                    print("  Trên thanh menu Chrome: View > Developer >")
+                    print("      'Allow JavaScript from Apple Events'")
+                    print("  Bật xong công cụ sẽ tự chạy tiếp.")
+                    print("=" * 68 + "\n")
+                    self._prompted_js_setting = True
+                time.sleep(3.0)
+        return False
+
+
+def run_with_chrome_applescript(args: argparse.Namespace, eligible: List[Dict]) -> Optional[Dict]:
+    """macOS: drive the user's real Chrome (their normal profile and login)."""
+    importer = AppleScriptImporter(dry_run=args.dry_run)
+    importer.goto(LIST_URL)  # also starts Chrome if it is not running
+    if not importer.wait_for_js_permission():
+        print("ERROR: Chrome never allowed JavaScript from Apple Events. Nothing imported.")
+        return None
+    if not importer.wait_for_login():
+        print("ERROR: timed out waiting for the grid. Nothing imported.")
+        return None
+    return run_import(importer, eligible)
+
+
 # --- browser launch ---------------------------------------------------------
 
 def _port_is_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
@@ -827,16 +973,56 @@ def find_firefox_binary() -> Optional[str]:
     return shutil.which("firefox") or shutil.which("firefox-esr")
 
 
-def launch_firefox(binary: str, profile_dir: str) -> subprocess.Popen:
-    """Start Firefox on a dedicated profile with Marionette enabled and wait for it.
+def _write_firefox_prefs(profile_dir: str) -> None:
+    """Seed a dedicated profile's preferences before Firefox starts.
 
-    A dedicated profile dir means this runs happily alongside the user's normal
-    Firefox and keeps its own persistent medinet login.
+    The important one is security.enterprise_roots: medinet's certificate chains to
+    a CA that lives in the operating-system trust store (which the user's normal
+    browser uses) but not in Firefox's own built-in store, so a fresh profile would
+    reject it as an unknown issuer. Turning this on makes Firefox trust the OS roots
+    too, so the site loads exactly as it does in the user's day-to-day browser.
+    Never applied to the user's real profile -- their settings are theirs.
     """
-    os.makedirs(profile_dir, exist_ok=True)
-    print(f"Launching Firefox with Marionette (profile: {profile_dir})...")
+    prefs = [
+        'user_pref("security.enterprise_roots.enabled", true);',
+        'user_pref("browser.shell.checkDefaultBrowser", false);',
+        'user_pref("datareporting.policy.dataSubmissionEnabled", false);',
+        'user_pref("browser.aboutwelcome.enabled", false);',
+    ]
+    with open(os.path.join(profile_dir, "user.js"), "w", encoding="utf-8") as f:
+        f.write("\n".join(prefs) + "\n")
+
+
+def firefox_is_running() -> bool:
+    """True if any Firefox instance is up (it would hold the default profile's lock)."""
+    if os.name == "nt":
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq firefox.exe"], capture_output=True, text=True
+        )
+        return "firefox.exe" in (result.stdout or "")
+    # -f matches the full command line; the binary path always contains "firefox"
+    # in lowercase on macOS and Linux (Linux pgrep has no -i flag).
+    result = subprocess.run(["pgrep", "-f", "firefox"], capture_output=True, text=True)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def launch_firefox(binary: str, profile_dir: Optional[str] = None) -> subprocess.Popen:
+    """Start the real Firefox with Marionette enabled and wait for its port.
+
+    With no profile_dir Firefox opens the user's own default profile -- their
+    existing medinet login and all. A profile_dir gives an isolated profile that
+    can run alongside their normal Firefox.
+    """
+    command = [binary, "--marionette"]
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
+        _write_firefox_prefs(profile_dir)
+        command += ["--no-remote", "-profile", profile_dir]
+        print(f"Launching Firefox with Marionette (profile riêng: {profile_dir})...")
+    else:
+        print("Launching Firefox with Marionette (profile thường của bạn)...")
     process = subprocess.Popen(
-        [binary, "--marionette", "--no-remote", "-profile", profile_dir],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -865,7 +1051,19 @@ def run_with_firefox(args: argparse.Namespace, eligible: List[Dict]) -> Optional
             "other automated Firefox instance and try again."
         )
 
-    launch_firefox(binary, FIREFOX_PROFILE_DIR)
+    if args.separate_profile:
+        launch_firefox(binary, FIREFOX_PROFILE_DIR)
+    else:
+        # The default profile: the user's own logins, bookmarks, everything. Firefox
+        # must be fully closed first -- a running instance holds the profile lock and
+        # ignores --marionette.
+        if firefox_is_running():
+            raise SystemExit(
+                "ERROR: Firefox đang mở. Hãy thoát hẳn Firefox (Cmd+Q / đóng hết cửa sổ)\n"
+                "       rồi chạy lại -- công cụ cần mở Firefox của bạn ở chế độ điều khiển.\n"
+                "       (Hoặc chạy với --separate-profile để dùng hồ sơ riêng.)"
+            )
+        launch_firefox(binary)
     client = Marionette()
     try:
         client.connect()
@@ -902,6 +1100,9 @@ def run_with_chrome(args: argparse.Namespace, eligible: List[Dict]) -> Optional[
                     viewport=None,
                     ignore_https_errors=True,
                     args=["--start-maximized"],
+                    # Drop the default --enable-automation flag so Chrome does not
+                    # show the "being controlled by automated test software" banner.
+                    ignore_default_args=["--enable-automation"],
                 )
                 break
             except Exception as exc:  # noqa: BLE001 -- try the next channel
@@ -923,18 +1124,187 @@ def run_with_chrome(args: argparse.Namespace, eligible: List[Dict]) -> Optional[
             context.close()
 
 
-def main() -> None:
-    args = parse_args()
-    eligible, no_ward = load_records(args.limit, args.dry_run)
+def run_selftest() -> bool:
+    """Check the packaging and environment without opening any browser window."""
+    print("Self-test (no browser window will open)\n")
+    ok = True
+
+    data_ok = os.path.exists(DATA_FILE) or os.path.exists(BUNDLED_SAMPLE)
+    print(f"  data file        : {'OK' if data_ok else 'MISSING'} ({DATA_FILE})")
+    ok = ok and data_ok
+
+    for module, label in (("openpyxl", "đọc Excel"), ("pypdf", "đọc PDF")):
+        try:
+            __import__(module)
+            print(f"  {module} ({label}): OK")
+        except ImportError as exc:
+            ok = False
+            print(f"  {module} ({label}): FAILED -- {exc}")
+
+    firefox = find_firefox_binary()
+    print(f"  Firefox (--browser firefox): {firefox or 'not found'}")
+
+    if sys.platform == "darwin":
+        chrome_app = os.path.exists("/Applications/Google Chrome.app")
+        print(f"  Chrome thật qua AppleScript (--browser chrome): "
+              f"{'OK' if chrome_app else 'không thấy Google Chrome.app'}")
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            _ = p.chromium.name  # starts the node driver; reads its package.json
+        print("  Playwright driver (chrome --separate-profile): OK")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"  Playwright driver (chrome --separate-profile): FAILED -- {exc}")
+
+    if not firefox and not ok:
+        print("\nNeither browser path is usable on this machine.")
+    print("\nSelf-test:", "PASSED" if ok else "had problems (see above)")
+    return ok
+
+
+# --- double-click flow --------------------------------------------------------
+
+def choose_file_dialog() -> Optional[str]:
+    """Open the OS-native file picker for the children list. None if cancelled."""
+    if sys.platform == "darwin":
+        proc = subprocess.run(
+            ["osascript", "-e",
+             'POSIX path of (choose file with prompt '
+             '"Chọn file danh sách trẻ (Excel/PDF/JSON)" '
+             'of type {"xlsx", "pdf", "json"})'],
+            capture_output=True, text=True,
+        )
+        path = (proc.stdout or "").strip()
+        return path or None
+    if os.name == "nt":
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$f = New-Object System.Windows.Forms.OpenFileDialog;"
+            "$f.Title = 'Chon file danh sach tre';"
+            "$f.Filter = 'Danh sach (*.xlsx;*.pdf;*.json)|*.xlsx;*.pdf;*.json';"
+            "if ($f.ShowDialog() -eq 'OK') { $f.FileName }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True, text=True,
+        )
+        path = (proc.stdout or "").strip()
+        return path or None
+    # Linux: zenity where available, otherwise typed path.
+    if shutil.which("zenity"):
+        proc = subprocess.run(
+            ["zenity", "--file-selection", "--title=Chọn file danh sách trẻ",
+             "--file-filter=*.xlsx *.pdf *.json"],
+            capture_output=True, text=True,
+        )
+        path = (proc.stdout or "").strip()
+        return path or None
+    typed = input("Nhập đường dẫn file danh sách (.xlsx/.pdf/.json): ").strip()
+    return typed or None
+
+
+def _ask(prompt: str, choices: Dict[str, str], default: str) -> str:
+    """A tiny numbered console menu; Enter picks the default."""
+    print(prompt)
+    for key, label in choices.items():
+        marker = " (Enter)" if key == default else ""
+        print(f"  [{key}] {label}{marker}")
+    while True:
+        answer = input("Chọn: ").strip() or default
+        if answer in choices:
+            return answer
+        print(f"  Không có lựa chọn {answer!r}, thử lại.")
+
+
+def interactive_main() -> None:
+    """What double-clicking the app runs: pick a file, pick a browser, go."""
+    print("=" * 68)
+    print("  NHẬP DANH SÁCH KHÁM SỨC KHỎE TRẺ EM -> medinet")
+    print("  Chỉ THÊM MỚI, tự bỏ qua trẻ đã có. Không sửa/xóa hồ sơ nào.")
+    print("=" * 68 + "\n")
+
+    action = _ask("Bạn muốn làm gì?", {
+        "1": "Nhập danh sách từ file (Excel / PDF / JSON)",
+        "2": "Tạo file Excel mẫu để điền danh sách",
+    }, default="1")
+    if action == "2":
+        target = os.path.join(BASE_DIR, "mau_danh_sach.xlsx")
+        parsers.create_template(target)
+        print(f"\nĐã tạo file mẫu: {target}")
+        print("Mở file này, điền danh sách trẻ (mỗi dòng một bé), lưu lại,")
+        print("rồi chạy công cụ lần nữa và chọn file đó.")
+        return
+
+    print("\nĐang mở hộp thoại chọn file...")
+    path = choose_file_dialog()
+    if not path:
+        print("Không chọn file nào -- thoát.")
+        return
+    if not os.path.exists(path):
+        raise SystemExit(f"Không thấy file: {path}")
+
+    args = argparse.Namespace(
+        browser="chrome", dry_run=False, limit=None,
+        separate_profile=False, selftest=False, file=path, make_template=False,
+    )
+
+    browser = _ask("\nDùng trình duyệt nào?", {
+        "1": "Chrome đang dùng của bạn" + (" (macOS)" if sys.platform == "darwin" else " -- hồ sơ riêng"),
+        "2": "Firefox của bạn (phải thoát Firefox trước)",
+        "3": "Cửa sổ riêng, đăng nhập 1 lần (Chrome/Edge)",
+    }, default="1")
+    if browser == "2":
+        args.browser = "firefox"
+    elif browser == "3":
+        args.separate_profile = True
+
+    mode = _ask("\nChế độ chạy?", {
+        "1": "Nhập thật",
+        "2": "Chạy thử -- điền form nhưng KHÔNG lưu",
+    }, default="1")
+    args.dry_run = mode == "2"
+
+    print()
+    run(args)
+
+
+def run(args: argparse.Namespace) -> None:
+    """Load the list and run the import with the chosen browser."""
+    eligible, no_ward = load_records(args.limit, args.dry_run, path=args.file)
 
     if args.browser == "firefox":
         results = run_with_firefox(args, eligible)
+    elif sys.platform == "darwin" and not args.separate_profile:
+        results = run_with_chrome_applescript(args, eligible)
     else:
         results = run_with_chrome(args, eligible)
 
     if results is None:
         return
     print_summary(results, no_ward, args.dry_run)
+
+
+def main() -> None:
+    # No arguments (a double-click) -> the guided flow with the file picker.
+    if len(sys.argv) <= 1:
+        interactive_main()
+        return
+
+    args = parse_args()
+
+    if args.selftest:
+        run_selftest()
+        return
+
+    if args.make_template:
+        target = os.path.join(BASE_DIR, "mau_danh_sach.xlsx")
+        parsers.create_template(target)
+        print(f"Đã tạo file mẫu: {target}")
+        return
+
+    run(args)
 
 
 def _pause(message: str) -> None:

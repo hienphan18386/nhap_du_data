@@ -1,4 +1,5 @@
-# Runtime dependency. The Firefox browser itself is fetched separately with:
-#   PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install firefox
-# so PyInstaller can bake it into the executable (see packaging/importer.spec).
+# Runtime dependencies. No browser is bundled -- the app drives the user's own
+# installed Chrome (AppleScript/Playwright) or Firefox (Marionette, stdlib-only).
 playwright==1.48.0
+openpyxl>=3.1     # read/write the Excel children list
+pypdf>=5.0        # extract text from PDF class lists

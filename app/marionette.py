@@ -48,9 +48,10 @@ class Marionette:
         if hello.get("marionetteProtocol") != 3:
             raise MarionetteError(f"Unsupported Marionette protocol: {hello!r}")
 
-        params = {
-            "capabilities": {"alwaysMatch": {"acceptInsecureCerts": accept_insecure_certs}}
-        }
+        # Raw Marionette reads the requested capabilities straight from the params
+        # object -- the WebDriver {"capabilities": {"alwaysMatch": {...}}} wrapper is
+        # silently ignored here (it leaves acceptInsecureCerts stuck at False).
+        params = {"acceptInsecureCerts": accept_insecure_certs}
         result = self.command("WebDriver:NewSession", params)
         self.session_id = result.get("sessionId")
         return result

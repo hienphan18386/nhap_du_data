@@ -1,7 +1,9 @@
 name: Build standalone importer
 
 # Build a self-contained medinet-importer executable for Windows, macOS and Linux.
-# PyInstaller cannot cross-compile, so each OS is built on its own runner.
+# The app drives the user's own installed Chrome/Firefox, so no browser is bundled;
+# builds are small and fast. PyInstaller cannot cross-compile, so each OS builds on
+# its own runner.
 on:
   push:
     tags: ["v*"]        # tag a release, e.g. `git tag v1.0 && git push --tags`
@@ -36,22 +38,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      # PLAYWRIGHT_BROWSERS_PATH=0 installs Firefox inside the playwright package
-      # so the spec can bundle it. The env var must also be set at build time.
-      - name: Download Firefox into the package
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
-        run: python -m playwright install firefox
-
-      - name: Install Firefox system libraries (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
-        run: python -m playwright install-deps firefox
-
       - name: Build executable
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
         run: pyinstaller packaging/importer.spec
 
       - name: Upload artifact
