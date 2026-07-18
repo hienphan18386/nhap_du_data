@@ -1,0 +1,4 @@
+# Runtime dependency. The Firefox browser itself is fetched separately with:
+#   PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install firefox
+# so PyInstaller can bake it into the executable (see packaging/importer.spec).
+playwright==1.48.0

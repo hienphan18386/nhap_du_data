@@ -1,0 +1,20 @@
+# Build output
+build/
+dist/
+*.spec.bak
+
+# Runtime files created next to the executable
+firefox-profile/
+.playwright-firefox-profile/
+import_results.json
+children.json
+
+# Archived one-off debug scripts -- kept locally, not pushed
+scripts/_archive/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

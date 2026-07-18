@@ -1,0 +1,62 @@
+name: Build standalone importer
+
+# Build a self-contained medinet-importer executable for Windows, macOS and Linux.
+# PyInstaller cannot cross-compile, so each OS is built on its own runner.
+on:
+  push:
+    tags: ["v*"]        # tag a release, e.g. `git tag v1.0 && git push --tags`
+  workflow_dispatch: {}  # or run it by hand from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: medinet-importer-windows
+            binary: dist/medinet-importer.exe
+          - os: macos-latest
+            artifact: medinet-importer-macos
+            binary: dist/medinet-importer
+          - os: ubuntu-latest
+            artifact: medinet-importer-linux
+            binary: dist/medinet-importer
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      # PLAYWRIGHT_BROWSERS_PATH=0 installs Firefox inside the playwright package
+      # so the spec can bundle it. The env var must also be set at build time.
+      - name: Download Firefox into the package
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: python -m playwright install firefox
+
+      - name: Install Firefox system libraries (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: python -m playwright install-deps firefox
+
+      - name: Build executable
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: pyinstaller packaging/importer.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
