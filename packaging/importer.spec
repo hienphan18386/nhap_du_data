@@ -30,8 +30,11 @@ for pj in glob.glob(os.path.join(pw_root, "driver", "**", "package.json"), recur
         continue
     datas.append((pj, os.path.join("playwright", os.path.relpath(os.path.dirname(pj), pw_root))))
 
-# The sample list, seeded next to the executable on first run (see load_records()).
-datas.append((os.path.join(ROOT, "app", "data", "children.json"), "data"))
+# Optional sample list, seeded next to the executable on first run (see load_records()).
+# Local real data is intentionally gitignored, so CI builds must not require it.
+sample_children = os.path.join(ROOT, "app", "data", "children.json")
+if os.path.exists(sample_children):
+    datas.append((sample_children, "data"))
 
 block_cipher = None
 
