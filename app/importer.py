@@ -40,6 +40,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from typing import Dict, List, Optional
 
 # Playwright is imported lazily inside the Chrome path so the Firefox path (pure
@@ -57,6 +58,9 @@ ROOT_URL = "https://quanlyskcd.medinet.org.vn/"
 # happens to be in the trẻ em dưới 6 group, and the app drifts to other groups on its
 # own -- from the root it lands on BenhTruyenNhiem_BenhAn.
 LIST_URL = "https://quanlyskcd.medinet.org.vn/nav_group/ksk_treemduoi6/app/main/dynamicreport/report/viewer-utility/KSK_KSKTE_TreEmDuoi24_ThongTinHanhChinh"
+
+# Khám định kỳ → TRẺ TỪ 6 - 17 TUỔI (M2)
+LIST_URL_M2 = "https://quanlyskcd.medinet.org.vn/app/main/dynamicreport/report/viewer-utility/KSKDK_DanhSach_KSK_M12"
 
 
 def _base_dir() -> str:
@@ -90,12 +94,22 @@ NGUOI_KHAM = "Nguyễn Ngọc Thành"
 
 # Marker element that only exists while the add/edit form is open.
 FORM_MARKER = ".TienSu_TX_NguoiBenhLao"
+FORM_MARKER_M2 = ".HoTen"  # M2 form has no TienSu; use HoTen input instead
 
 # The one form this script may ever type into. The app sometimes drifts to a different
 # dynamic form (a stall, a stray click), and every form here looks alike -- same widgets,
 # same Lưu button -- so filling the wrong one would quietly file a child's data against
 # the wrong record type. The URL is what actually names the form.
 FORM_URL_MARKER = "KSK_TreEmDuoi6_ThongTinHanhChinh_MC"
+FORM_URL_MARKER_M2 = "KSKD18_TTHC"
+
+# M2 (6–17 tuổi) dropdown choices. Verified selectors; the two values below are the
+# best-guess defaults, easy to change here once a trial confirms them.
+M2_DOITUONG = "Trẻ từ đủ 6 tuổi đến 18 tuổi đi học (lớp 1 đến lớp 12)"
+M2_DOITUONGKHAM = "Trường Học"  # địa điểm khám
+M2_QUANHE_GIAMHO = "Mẹ"
+M2_CHITRA = "Ngân sách thành phố hỗ trợ"       # .HinhThucChiTraKhamSK
+M2_CHITRA_CHITIET = "Khám theo hợp đồng"       # .HinhThucChiTraKhamSK_ChiTiet
 
 
 def js_string(value: str) -> str:
@@ -124,12 +138,73 @@ def clean_school_name(school_name: str) -> str:
     return name
 
 
+# Words that name a school *type*, not the school itself. Dropping them leaves the
+# distinctive part ("Trường Tiểu học Đinh Bộ Lĩnh" -> "Đinh Bộ Lĩnh"), which is what
+# the M2 school lookup searches the server on and shows as "TH Đinh Bộ Lĩnh - ...".
+_SCHOOL_TYPE_WORDS = {
+    "trường", "tiểu", "học", "th", "thcs", "thpt", "mầm", "non", "mn",
+    "mẫu", "giáo", "trung", "cơ", "sở", "phổ", "thông", "cấp",
+}
+
+
+def school_search_core(school_name: str) -> str:
+    """The distinctive part of a school name, for the remote school lookup."""
+    words = clean_school_name(school_name).split()
+    core = [w for w in words if w.lower() not in _SCHOOL_TYPE_WORDS]
+    return " ".join(core) or clean_school_name(school_name)
+
+
 class Importer:
     """Drives the import over a Playwright page. Firefox uses the subclass below."""
 
-    def __init__(self, page=None, dry_run: bool = False):
+    def __init__(self, page=None, dry_run: bool = False, age_group: str = "M1",
+                 exam_date: Optional[str] = None):
         self.page = page
         self.dry_run = dry_run
+        self.age_group = age_group
+        # Fix the exam date once, at start of the run, so a batch that crosses midnight
+        # still files every child under the date it began -- never the app's shifting
+        # "today". dd/MM/yyyy, matching the form.
+        self.exam_date = exam_date or datetime.now().strftime("%d/%m/%Y")
+
+    @property
+    def list_url(self) -> str:
+        return LIST_URL_M2 if self.age_group == "M2" else LIST_URL
+
+    @property
+    def form_marker(self) -> str:
+        return FORM_MARKER_M2 if self.age_group == "M2" else FORM_MARKER
+
+    @property
+    def form_url_marker(self) -> str:
+        return FORM_URL_MARKER_M2 if self.age_group == "M2" else FORM_URL_MARKER
+
+    @property
+    def cccd_selector(self) -> str:
+        """The child's ID field: M1 form calls it MaDinhDanh, M2 calls it DinhDanhCaNhan."""
+        return ".DinhDanhCaNhan" if self.age_group == "M2" else ".MaDinhDanh"
+
+    @property
+    def save_button_label(self) -> str:
+        """M1's save button reads 'Lưu'; M2's reads 'Lưu thay đổi'."""
+        return "Lưu thay đổi" if self.age_group == "M2" else "Lưu"
+
+    @property
+    def search_cccd_selector(self) -> str:
+        """The grid's CCCD search box -- different id on each report."""
+        return ('input[id$="_KSKDK_DinhDanhCaNhan"]' if self.age_group == "M2"
+                else 'input[id$="_MaDinhDanh"]')
+
+    @property
+    def search_date_selector(self) -> str:
+        """The grid's date filter, cleared before each search so it never hides a match."""
+        return ('input[id$="_KSKDK_NgayKham"]' if self.age_group == "M2"
+                else 'input[id$="_NgayTao"]')
+
+    @property
+    def grid_marker(self) -> str:
+        """A bit of text unique to the right report grid, to pick it out of hidden ones."""
+        return "ĐỊNH DANH CÁ NHÂN" if self.age_group == "M2" else "MẪU PHIẾU KHÁM"
 
     def run_js(self, code: str):
         return self.page.evaluate(f"() => {{ return ({code}); }}")
@@ -141,7 +216,7 @@ class Importer:
 
     def wait_for_login(self, timeout_s: int = 600) -> bool:
         """Block until the report grid is reachable, prompting for a manual login if needed."""
-        print(f"Opening {LIST_URL}")
+        print(f"Opening {self.list_url}")
         if self.open_list():
             print("Grid is loaded and ready.")
             return True
@@ -169,7 +244,7 @@ class Importer:
         boots from the root, and until it has, the report URL produces an empty body
         that is indistinguishable from a slow-loading grid.
         """
-        self.goto(LIST_URL)
+        self.goto(self.list_url)
         if self.wait_for_grid(20):
             return True
 
@@ -179,7 +254,7 @@ class Importer:
             time.sleep(1.0)
             if (self.run_js("document.body.innerText.trim().length") or 0) > 50:
                 break
-        self.goto(LIST_URL)
+        self.goto(self.list_url)
         return self.wait_for_grid(timeout_s)
 
     def wait_for_grid(self, timeout_s: int = 60) -> bool:
@@ -200,11 +275,11 @@ class Importer:
         """)
 
     def is_form_open(self) -> bool:
-        return self.run_js(f"!!document.querySelector({js_string(FORM_MARKER)})")
+        return self.run_js(f"!!document.querySelector({js_string(self.form_marker)})")
 
     def on_expected_form(self) -> bool:
         """True only on the Thông tin hành chính form this script is written for."""
-        return FORM_URL_MARKER in self.run_js("location.href")
+        return self.form_url_marker in self.run_js("location.href")
 
     def form_matches_record(self, r: Dict[str, str]) -> bool:
         """Check the form is still the right one and still holds this child's data.
@@ -217,14 +292,14 @@ class Importer:
             print(f"  ABORT: not on {FORM_URL_MARKER} any more -- not saving")
             return False
 
-        actual = self.run_js("""
-            (function() {
-                const read = sel => {
+        actual = self.run_js(f"""
+            (function() {{
+                const read = sel => {{
                     const el = document.querySelector(sel + ' input.dx-texteditor-input');
                     return el ? el.value.trim() : null;
-                };
-                return {hoTen: read('.HoTen'), maDinhDanh: read('.MaDinhDanh')};
-            })()
+                }};
+                return {{hoTen: read('.HoTen'), maDinhDanh: read({js_string(self.cccd_selector)})}};
+            }})()
         """)
         expected_name = r["child_name"].upper().strip()
         if (actual.get("hoTen") or "").upper() != expected_name:
@@ -271,23 +346,23 @@ class Importer:
                     print("  ERROR: opened an existing record, not a blank form")
                     return False
                 if not self.on_expected_form():
-                    print(f"  ERROR: opened a different form, expected {FORM_URL_MARKER}")
+                    print(f"  ERROR: opened a different form, expected {self.form_url_marker}")
                     return False
                 return True
         print("  ERROR: form did not open")
         return False
 
     def click_save(self) -> None:
-        self.run_js("""
-            (function() {
-                const xpath = "//span[text()='Lưu']";
-                const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                if (r.singleNodeValue) { r.singleNodeValue.click(); return true; }
-                const btns = Array.from(document.querySelectorAll('button, span, div'))
-                    .filter(el => el.innerText.trim() === 'Lưu');
-                if (btns.length) { btns[0].click(); return true; }
+        self.run_js(f"""
+            (function() {{
+                const label = {js_string(self.save_button_label)};
+                const byAria = document.querySelector('.dx-button[aria-label="' + label + '"]');
+                if (byAria) {{ byAria.click(); return true; }}
+                const el = Array.from(document.querySelectorAll('.dx-button, button, span, div'))
+                    .find(e => e.innerText.trim() === label);
+                if (el) {{ (el.closest('.dx-button') || el).click(); return true; }}
                 return false;
-            })()
+            }})()
         """)
 
     def validation_messages(self) -> List[str]:
@@ -303,19 +378,28 @@ class Importer:
     # --- duplicate check ----------------------------------------------------
 
     def type_search_cccd(self, cccd: str) -> None:
-        """Put the CCCD in the grid's search box.
+        """Type the CCCD into the grid's search box, per character.
 
-        Assigning .value only updates the DOM: the DevExtreme widget keeps its own
-        value, so 'Xem' re-runs the previous query and the grid answers about the
-        previous child. Drivers that can type for real should override this.
+        Assigning .value only updates the DOM; the DevExtreme widget keeps its own
+        value, so 'Xem' would re-run the previous query. Simulating real keystrokes
+        (the same way fill_text_fields does) is what actually commits the filter.
+        Marionette overrides this with true OS-level typing.
         """
         self.run_js(f"""
             (function() {{
-                const input = document.querySelector('input[id$="_MaDinhDanh"]');
+                const input = document.querySelector({js_string(self.search_cccd_selector)});
                 if (!input) return false;
-                input.value = {js_string(cccd)};
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.focus();
+                input.value = '';
+                for (const ch of {js_string(cccd)}) {{
+                    input.dispatchEvent(new KeyboardEvent('keydown', {{ key: ch, bubbles: true }}));
+                    input.dispatchEvent(new KeyboardEvent('keypress', {{ key: ch, bubbles: true }}));
+                    input.value += ch;
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new KeyboardEvent('keyup', {{ key: ch, bubbles: true }}));
+                }}
                 input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
                 return true;
             }})()
         """)
@@ -344,6 +428,15 @@ class Importer:
         must treat as "ask a human" rather than either yes or no: a wrong yes drops a
         child silently, a wrong no files them twice.
         """
+        if self.age_group == "M2":
+            # The M2 report grid does not re-run its search under synthetic events, so a
+            # pre-check here is not trustworthy. medinet itself never files a second
+            # record for an existing CCCD (verified), so we proceed and let the save
+            # outcome classify it: a new phieukhamId = added, a silent non-save with no
+            # validation error = already on file. Safe either way -- no duplicate is
+            # ever created.
+            return False
+
         for attempt in range(1, attempts + 1):
             answer, state = self.search_grid(cccd, timeout_s)
             if answer is not None:
@@ -362,17 +455,17 @@ class Importer:
         every child alphabetically -- a page on which the name being looked for is quite
         likely to appear, belonging to somebody else. The CCCD is proof either way.
         """
-        self.run_js("""
-            (function() {
-                const ngayTaoEl = document.querySelector('input[id$="_NgayTao"]');
-                if (ngayTaoEl) {
+        self.run_js(f"""
+            (function() {{
+                const ngayTaoEl = document.querySelector({js_string(self.search_date_selector)});
+                if (ngayTaoEl) {{
                     ngayTaoEl.focus();
                     ngayTaoEl.value = '';
-                    ngayTaoEl.dispatchEvent(new Event('input', { bubbles: true }));
-                    ngayTaoEl.dispatchEvent(new Event('change', { bubbles: true }));
-                }
+                    ngayTaoEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    ngayTaoEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
                 return true;
-            })()
+            }})()
         """)
         self.type_search_cccd(cccd)
         self.click_search()
@@ -383,7 +476,7 @@ class Importer:
             state = self.run_js(f"""
                 (function() {{
                     const grid = Array.from(document.querySelectorAll('.dx-datagrid'))
-                        .find(g => g.offsetHeight > 0 && g.innerText.includes('MẪU PHIẾU KHÁM'));
+                        .find(g => g.offsetHeight > 0 && g.innerText.includes({js_string(self.grid_marker)}));
                     if (!grid) return 'no-grid';
                     const busy = Array.from(document.querySelectorAll('.dx-loadpanel .dx-overlay-content, .dx-loadindicator'))
                         .some(el => el.offsetHeight > 0);
@@ -454,6 +547,127 @@ class Importer:
                 return true;
             }})()
         """)
+        return False
+
+    def select_school_lookup(self, selector: str, school_name: str, timeout_s: int = 8) -> bool:
+        """Pick a school from a server-backed lookup (M2 .TreEm_TruongHocId).
+
+        Unlike the plain dropdown, the options are fetched from the server as the user
+        types, so this types the distinctive part of the name, waits for the result to
+        arrive, then clicks the row that contains it.
+        """
+        core = school_search_core(school_name)
+        print(f"  trường {selector} -> tìm '{core}'")
+        self.run_js(f"""
+            (function() {{
+                const btn = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
+                if (btn) btn.click();
+                return true;
+            }})()
+        """)
+        time.sleep(0.8)
+        self.run_js(f"""
+            (function() {{
+                const input = document.querySelector({js_string(selector + ' input.dx-texteditor-input')});
+                if (!input) return false;
+                input.focus();
+                input.value = {js_string(core)};
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                return true;
+            }})()
+        """)
+        needle = core.lower()
+        for _ in range(timeout_s):
+            time.sleep(0.8)
+            res = self.run_js(f"""
+                (function() {{
+                    const needle = {js_string(needle)};
+                    const pops = Array.from(document.querySelectorAll('.dx-overlay-wrapper'))
+                        .filter(p => p.offsetHeight > 0);
+                    const pop = pops[pops.length - 1];
+                    if (!pop) return 'no-pop';
+                    const items = Array.from(pop.querySelectorAll('.dx-list-item'))
+                        .filter(e => e.offsetHeight > 0);
+                    const hit = items.find(e => e.innerText.toLowerCase().includes(needle));
+                    if (hit) {{ hit.click(); return 'ok'; }}
+                    return 'waiting (' + items.length + ')';
+                }})()
+            """)
+            if res == "ok":
+                return True
+        print(f"  KHÔNG chọn được trường {school_name!r}")
+        self.run_js(f"""
+            (function() {{
+                const btn = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
+                if (btn) btn.click();
+                return true;
+            }})()
+        """)
+        return False
+
+    def set_datebox(self, selector: str, ddmmyyyy: str) -> bool:
+        """Set a DevExtreme DateBox by clicking its calendar.
+
+        Typing into a pre-filled datebox updates only the display, not the value that
+        gets saved (the widget keeps its own model). Clicking a calendar cell is a real
+        widget interaction, so it commits the value medinet actually files.
+        """
+        try:
+            day, month, year = [int(x) for x in str(ddmmyyyy).split("/")]
+        except (ValueError, AttributeError):
+            return False
+        iso = f"{year:04d}/{month:02d}/{day:02d}"  # matches the cell's data-value
+
+        self.run_js(f"""(function() {{
+            const b = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
+            if (b) b.click();
+            return true;
+        }})()""")
+        time.sleep(0.8)
+
+        for _ in range(24):  # at most ~2 years of paging
+            res = self.run_js(f"""
+                (function() {{
+                    const target = {js_string(iso)};
+                    const cal = document.querySelector('.dx-calendar');
+                    if (!cal) return 'no-cal';
+                    const cell = cal.querySelector('.dx-calendar-cell[data-value="' + target + '"]');
+                    if (cell && !cell.classList.contains('dx-calendar-other-view')) {{
+                        cell.click();
+                        return 'ok';
+                    }}
+                    const main = Array.from(cal.querySelectorAll('.dx-calendar-cell:not(.dx-calendar-other-view)'))
+                        .map(c => c.getAttribute('data-value')).filter(Boolean);
+                    if (!main.length) return 'no-cells';
+                    if (target < main[0]) {{
+                        const p = cal.querySelector('.dx-calendar-navigator-previous-view');
+                        if (p) {{ p.click(); return 'paged'; }}
+                    }} else if (target > main[main.length - 1]) {{
+                        const n = cal.querySelector('.dx-calendar-navigator-next-view');
+                        if (n) {{ n.click(); return 'paged'; }}
+                    }} else if (cell) {{
+                        cell.click();
+                        return 'ok';
+                    }}
+                    return 'stuck';
+                }})()
+            """)
+            if res == "ok":
+                time.sleep(0.4)
+                return True
+            if res in ("no-cal", "no-cells", "stuck"):
+                break
+            time.sleep(0.4)
+
+        print(f"  KHÔNG chọn được ngày {ddmmyyyy} trên lịch -- điền tay (có thể không lưu đúng)")
+        self.run_js(f"""(function() {{
+            if (document.querySelector('.dx-calendar')) {{
+                const b = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
+                if (b) b.click();
+            }}
+            return true;
+        }})()""")
+        self.fill_text_fields({selector: ddmmyyyy})
         return False
 
     def fill_text_fields(self, fields: Dict[str, str]) -> None:
@@ -543,7 +757,7 @@ class Importer:
     # --- one record ---------------------------------------------------------
 
     def fill_form(self, r: Dict[str, str]) -> None:
-        """Fill an open blank form with one child's details. Does not save."""
+        """Fill an open blank form with one child's details (M1). Does not save."""
         bhyt = valid_bhyt(r.get("bhyt"))
         if r.get("bhyt") and not bhyt:
             print(f"  BHYT {r['bhyt']!r} is not a full 15-char number -- filing without it")
@@ -578,6 +792,105 @@ class Importer:
         })
         time.sleep(1.5)
 
+    def fill_form_m2(self, r: Dict[str, str]) -> None:
+        """Fill an open blank M2 (6–17 tuổi) form. Selectors verified on KSKD18_TTHC.
+
+        Does not save. The exam date (.NgayKham) is left as the app's default (today).
+        """
+        bhyt = valid_bhyt(r.get("bhyt"))
+        if r.get("bhyt") and not bhyt:
+            print(f"  BHYT {r['bhyt']!r} không đủ 15 số -- bỏ trống BHYT")
+
+        guardian_cccd = r.get("mother_cccd") or ""  # already blanked if it was all zeros
+        phone = r.get("phone", "")
+
+        # Force the exam date to the run's fixed value (not the form's shifting default),
+        # so an overnight batch keeps one exam date throughout. Via the calendar, because
+        # typing into this pre-filled datebox does not commit the saved value.
+        self.set_datebox(".NgayKham", self.exam_date)
+
+        # Personal + guardian text fields. The guardian is the child's mother in these
+        # lists; the same phone stands in for the child's own SĐT (required, no column).
+        text_fields = {
+            ".HoTen": r["child_name"].upper(),
+            ".DinhDanhCaNhan": r["child_cccd"],
+            ".NgaySinh": r["dob"],
+            ".BHYT": bhyt,
+            ".SDT": phone,
+            ".DiaChiHienTai": r["address"],
+            ".TreEm_NguoiGiamHo": r["mother_name"],
+            ".TreEm_SDT_NguoiGiamHo": phone,
+        }
+        if guardian_cccd:
+            text_fields[".TreEm_CCCD_NguoiGiamHo"] = guardian_cccd
+        self.fill_text_fields(text_fields)
+        time.sleep(1.0)
+
+        # Đối tượng (nhóm bệnh nhân) + hình thức khám + phường/xã của trẻ + quan hệ giám hộ
+        self.select_searchable_dropdown(".DoiTuong_M13", M2_DOITUONG)
+        self.select_searchable_dropdown(".DoiTuongKham", M2_DOITUONGKHAM)
+        self.select_searchable_dropdown(".DiaChiHienTai_XaPhuong", r["ward"])
+        self.select_searchable_dropdown(".TreEm_MQH_NguoiGiamHo", M2_QUANHE_GIAMHO)
+
+        self.set_choices_m2("Nam" if r["gender"] == "Nam" else "Nữ")
+        time.sleep(1.0)
+
+        # Trường học: phường/xã, tên trường, rồi ghi đè địa chỉ + lớp (chọn trường có
+        # thể tự điền địa chỉ, nên điền text sau cùng).
+        self.select_searchable_dropdown(".TreEm_XaPhuong", r["school_ward"])
+        self.select_school_lookup(".TreEm_TruongHocId", r["school_name"])
+        self.fill_text_fields({
+            ".TreEm_DiaChiTruong": r["school_address"],
+            ".TreEm_Lop": str(r["lop"]),
+        })
+        time.sleep(1.5)
+
+    def set_choices_m2(self, gender: str) -> None:
+        """Set the M2 radios and the required 'hình thức chi trả' lists.
+
+        Two radios (Giới tính, 'Trẻ em đang đi học' = Có) plus two dx-list picks:
+        the payment method and its detail. The detail depends on the method, so it
+        is selected in a second pass after the first has registered.
+        """
+        js_helpers = """
+            function clickDx(el) {
+                if (!el) return;
+                el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                if (typeof el.focus === 'function') el.focus();
+                el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                el.click();
+            }
+            function pickRadio(groupSelector, label) {
+                const el = Array.from(document.querySelectorAll(groupSelector + ' .dx-radiobutton'))
+                    .find(e => e.innerText.trim() === label);
+                if (el && !el.classList.contains('dx-radiobutton-checked')) clickDx(el);
+            }
+            function pickListItem(groupSelector, label) {
+                const item = Array.from(document.querySelectorAll(groupSelector + ' .dx-list-item'))
+                    .find(e => e.innerText.trim() === label);
+                if (item) clickDx(item.querySelector('.dx-radiobutton') || item);
+            }
+        """
+        self.run_js(f"""
+            (function() {{
+                {js_helpers}
+                pickRadio('.GioiTinh', {js_string(gender)});
+                pickRadio('.TreEm_DangDiHoc', 'Có');
+                pickListItem('.HinhThucChiTraKhamSK', {js_string(M2_CHITRA)});
+                return true;
+            }})()
+        """)
+        time.sleep(0.8)
+        self.run_js(f"""
+            (function() {{
+                {js_helpers}
+                pickListItem('.HinhThucChiTraKhamSK_ChiTiet', {js_string(M2_CHITRA_CHITIET)});
+                return true;
+            }})()
+        """)
+
     def enter_child_record(self, r: Dict[str, str]) -> str:
         """Fill and save one child. Returns 'success' | 'duplicate' | 'failed'."""
         print(f"--- entering {r['child_name']} ({r['child_cccd']})")
@@ -585,7 +898,10 @@ class Importer:
         if not self.open_new_form():
             return "failed"
 
-        self.fill_form(r)
+        if self.age_group == "M2":
+            self.fill_form_m2(r)
+        else:
+            self.fill_form(r)
 
         if not self.form_matches_record(r):
             return "failed"
@@ -597,7 +913,11 @@ class Importer:
 
         self.click_save()
 
-        for attempt in range(45):
+        # A successful save routes to a phieukhamId within a few seconds. M2 gives no
+        # popup when it silently refuses a duplicate, so it does not need the long M1
+        # wait -- a shorter timeout there just means less idle time per existing child.
+        wait_s = 25 if self.age_group == "M2" else 45
+        for attempt in range(wait_s):
             time.sleep(1.0)
             record_id = self.current_record_id()
             if record_id:
@@ -622,8 +942,16 @@ class Importer:
                 self.click_back()
                 return "duplicate"
 
-        print("  WARNING: no phieukhamId after 45s -- not saved.")
-        for message in self.validation_messages():
+        # Timed out with no new record. If the form has no complaint, medinet quietly
+        # refused it -- which for M2 means this CCCD is already on file (it never makes
+        # a duplicate). A form that IS complaining is a genuine fill problem.
+        messages = self.validation_messages()
+        if not messages:
+            print("  không tạo phiếu mới và form không báo lỗi -> có thể đã nhập trước đó, bỏ qua")
+            self.click_back()
+            return "duplicate"
+        print(f"  WARNING: no phieukhamId after {wait_s}s -- not saved.")
+        for message in messages:
             print(f"    form says: {message}")
         return "failed"
 
@@ -657,12 +985,50 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="check the packaging and installed browsers without opening any window",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--check-file",
+        metavar="PATH",
+        help="read a list file and print a summary, without opening any browser",
+    )
+    parser.add_argument(
+        "--age-group",
+        choices=["m1", "m2"],
+        default="m1",
+        help="m1 = Trẻ dưới 6 tuổi (default), m2 = Trẻ từ 6–17 tuổi",
+    )
+    parser.add_argument(
+        "--exam-date",
+        metavar="DD/MM/YYYY",
+        help="ngày khám cố định cho cả lần chạy (mặc định: ngày lúc bắt đầu chạy)",
+    )
+    args = parser.parse_args()
+    # The Importer compares against "M1"/"M2"; keep CLI input consistent with the
+    # interactive flow, which already hands over the uppercase form.
+    args.age_group = args.age_group.upper()
+    return args
+
+
+def is_importable_cccd(cccd: Optional[str]) -> bool:
+    """A CCCD we will actually file.
+
+    Placeholders are skipped: blank, or any single repeated digit -- 999999999999,
+    000000000000, ... -- which the source lists use to mark "no real ID number".
+    """
+    cccd = (cccd or "").strip()
+    if not cccd:
+        return False
+    if len(set(cccd)) == 1:
+        return False
+    return True
 
 
 def load_records(limit: Optional[int] = None, dry_run: bool = False,
-                 path: Optional[str] = None):
-    """Load the children list (xlsx/pdf/json) and split off rows missing a ward."""
+                 path: Optional[str] = None, age_group: str = "M1"):
+    """Load the children list (xlsx/pdf/json) and split off rows we should not file.
+
+    Returns (eligible, no_ward, no_guardian). no_guardian is only populated for M2,
+    whose form requires a guardian CCCD -- those rows are skipped for manual entry.
+    """
     if path is None:
         if not os.path.exists(DATA_FILE) and os.path.exists(BUNDLED_SAMPLE):
             shutil.copyfile(BUNDLED_SAMPLE, DATA_FILE)
@@ -675,22 +1041,40 @@ def load_records(limit: Optional[int] = None, dry_run: bool = False,
     data: List[Dict] = parsers.load_any(path)
 
     no_ward = [r for r in data if not r.get("ward")]
-    eligible = [r for r in data if r.get("ward")]
-    if limit:
-        eligible = eligible[:limit]
+    bad_cccd = [r for r in data if r.get("ward") and not is_importable_cccd(r.get("child_cccd"))]
+    candidates = [r for r in data if r.get("ward") and is_importable_cccd(r.get("child_cccd"))]
 
-    print(f"Đọc được {len(data)} hồ sơ: {len(eligible)} sẽ xử lý, {len(no_ward)} bỏ qua (thiếu Phường/Xã).")
+    # M2's form makes the guardian CCCD mandatory, so a row without one cannot be
+    # saved. Skip those and list them for the user to enter by hand.
+    no_guardian: List[Dict] = []
+    if age_group == "M2":
+        no_guardian = [r for r in candidates if not (r.get("mother_cccd") or "").strip()]
+        candidates = [r for r in candidates if (r.get("mother_cccd") or "").strip()]
+
+    eligible = candidates[:limit] if limit else candidates
+
+    extra = f", {len(no_guardian)} thiếu CCCD người giám hộ" if age_group == "M2" else ""
+    print(f"Đọc được {len(data)} hồ sơ: {len(eligible)} sẽ xử lý, "
+          f"{len(no_ward)} thiếu Phường/Xã, {len(bad_cccd)} mã định danh không hợp lệ{extra} (bỏ qua).")
+    for r in bad_cccd:
+        print(f"  Bỏ qua (mã định danh {r.get('child_cccd')!r}): TT{r.get('tt')} {r.get('child_name')}")
     if dry_run:
         print("*** CHẠY THỬ: sẽ không lưu gì ***")
-    return eligible, no_ward
+    return eligible, no_ward, no_guardian
 
 
-def run_import(importer: "Importer", eligible: List[Dict]) -> Dict[str, List[str]]:
-    """Walk the eligible records, skipping anyone already in the system."""
+def run_import(importer: "Importer", eligible: List[Dict],
+               trial_first: bool = False) -> Dict[str, List[str]]:
+    """Walk the eligible records, skipping anyone already in the system.
+
+    When trial_first is True (M2), import one record first, then ask for
+    confirmation before continuing with the rest.
+    """
     results: Dict[str, List[str]] = {
         "success": [], "skipped_existing": [], "duplicate": [], "failed": [], "dry-run": [],
         "unverified": [],
     }
+    confirmed = not trial_first  # M1 runs without pausing
 
     for idx, r in enumerate(eligible, 1):
         label = f"{r['child_name']} ({r['child_cccd']})"
@@ -712,16 +1096,38 @@ def run_import(importer: "Importer", eligible: List[Dict]) -> Dict[str, List[str
         results[status].append(label)
         time.sleep(2.0)
 
+        # After the first real import in trial mode, ask the user to confirm
+        if not confirmed and status in ("success", "dry-run"):
+            print("\n" + "=" * 68)
+            print(f"  BẢN THỬ ĐÃ NHẬP: {r['child_name']}")
+            print(f"  CCCD: {r['child_cccd']}")
+            print(f"  Trường: {r.get('school_name', '')} | Lớp: {r.get('lop', '')}")
+            print(f"  Kết quả: {status}")
+            print(f"  Còn lại: {len(eligible) - idx} học sinh")
+            print("=" * 68)
+            try:
+                answer = input("Tiếp tục nhập hết? (y/n): ").strip().lower()
+            except EOFError:
+                answer = "y"
+            if answer != "y":
+                print("Dừng lại theo yêu cầu.")
+                break
+            confirmed = True
+            print("OK, tiếp tục nhập...")
+
     return results
 
 
-def print_summary(results: Dict[str, List[str]], no_ward: List[Dict], dry_run: bool = False) -> None:
+def print_summary(results: Dict[str, List[str]], no_ward: List[Dict], dry_run: bool = False,
+                  no_guardian: Optional[List[Dict]] = None) -> None:
+    no_guardian = no_guardian or []
     print("\n=== FINISHED ===")
     print(f"Newly imported : {len(results['success'])}")
-    print(f"Already present: {len(results['skipped_existing'])}")
-    print(f"Duplicate popup: {len(results['duplicate'])}")
+    print(f"Already present: {len(results['skipped_existing']) + len(results['duplicate'])}")
     print(f"Failed         : {len(results['failed'])}")
     print(f"Unverified     : {len(results['unverified'])}")
+    if no_guardian:
+        print(f"Thiếu CCCD mẹ  : {len(no_guardian)} (bỏ qua, nhập tay)")
     if dry_run:
         print(f"Dry-run filled : {len(results['dry-run'])}")
 
@@ -735,21 +1141,28 @@ def print_summary(results: Dict[str, List[str]], no_ward: List[Dict], dry_run: b
         for label in results["unverified"]:
             print(f"  {label}")
 
+    if no_guardian:
+        print(f"\nThiếu CCCD người giám hộ -- form M2 bắt buộc, nhập tay {len(no_guardian)} em này:")
+        for r in no_guardian:
+            print(f"  TT{r['tt']:>3} {r['child_name']:<28} (CCCD {r['child_cccd']})")
+
     if no_ward:
-        print(f"\nNot attempted -- no ward in the PDF, enter these {len(no_ward)} by hand:")
+        print(f"\nNot attempted -- no ward, enter these {len(no_ward)} by hand:")
         for r in no_ward:
             print(f"  TT{r['tt']:>3} {r['child_name']:<28} {r['address']}")
 
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"results": results, "no_ward": no_ward}, f, ensure_ascii=False, indent=2)
+        json.dump({"results": results, "no_ward": no_ward, "no_guardian": no_guardian},
+                  f, ensure_ascii=False, indent=2)
     print(f"\nDetails written to {RESULTS_FILE}")
 
 
 class MarionetteImporter(Importer):
     """The Importer with page.evaluate()/page.goto() swapped for Marionette calls."""
 
-    def __init__(self, client: Marionette, dry_run: bool = False):
-        super().__init__(page=None, dry_run=dry_run)
+    def __init__(self, client: Marionette, dry_run: bool = False, age_group: str = "M1",
+                 exam_date: Optional[str] = None):
+        super().__init__(page=None, dry_run=dry_run, age_group=age_group, exam_date=exam_date)
         self.client = client
 
     def run_js(self, code: str):
@@ -764,7 +1177,7 @@ class MarionetteImporter(Importer):
         The trailing Tab is what commits it: DevExtreme only takes the typed value on
         blur, and relying on the click of 'Xem' to provide that blur is fragile.
         """
-        element_id = self.client.find_element('input[id$="_MaDinhDanh"]', using="css selector")
+        element_id = self.client.find_element(self.search_cccd_selector, using="css selector")
         if element_id is None:
             super().type_search_cccd(cccd)
             return
@@ -813,8 +1226,8 @@ class MarionetteImporter(Importer):
     def click_save(self) -> None:
         # No JS fallback: a JS click on Lưu tends to fire no save request at all, and
         # silently not saving is worse than reporting a failure.
-        if not self.real_click_button("Lưu"):
-            print("  ERROR: could not click Lưu")
+        if not self.real_click_button(self.save_button_label):
+            print(f"  ERROR: could not click {self.save_button_label!r}")
 
 
 class AppleScriptJSDisabled(RuntimeError):
@@ -832,8 +1245,9 @@ class AppleScriptImporter(Importer):
 
     SITE = "quanlyskcd.medinet.org.vn"
 
-    def __init__(self, dry_run: bool = False):
-        super().__init__(page=None, dry_run=dry_run)
+    def __init__(self, dry_run: bool = False, age_group: str = "M1",
+                 exam_date: Optional[str] = None):
+        super().__init__(page=None, dry_run=dry_run, age_group=age_group, exam_date=exam_date)
         self._prompted_js_setting = False
 
     @staticmethod
@@ -923,15 +1337,17 @@ end tell
 
 def run_with_chrome_applescript(args: argparse.Namespace, eligible: List[Dict]) -> Optional[Dict]:
     """macOS: drive the user's real Chrome (their normal profile and login)."""
-    importer = AppleScriptImporter(dry_run=args.dry_run)
-    importer.goto(LIST_URL)  # also starts Chrome if it is not running
+    age_group = getattr(args, 'age_group', 'M1')
+    importer = AppleScriptImporter(dry_run=args.dry_run, age_group=age_group,
+                                   exam_date=getattr(args, 'exam_date', None))
+    importer.goto(importer.list_url)  # also starts Chrome if it is not running
     if not importer.wait_for_js_permission():
         print("ERROR: Chrome never allowed JavaScript from Apple Events. Nothing imported.")
         return None
     if not importer.wait_for_login():
         print("ERROR: timed out waiting for the grid. Nothing imported.")
         return None
-    return run_import(importer, eligible)
+    return run_import(importer, eligible, trial_first=(age_group == "M2"))
 
 
 # --- browser launch ---------------------------------------------------------
@@ -1067,11 +1483,14 @@ def run_with_firefox(args: argparse.Namespace, eligible: List[Dict]) -> Optional
     client = Marionette()
     try:
         client.connect()
-        importer = MarionetteImporter(client, dry_run=args.dry_run)
+        importer = MarionetteImporter(client, dry_run=args.dry_run,
+                                       age_group=getattr(args, 'age_group', 'M1'),
+                                       exam_date=getattr(args, 'exam_date', None))
         if not importer.wait_for_login():
             print("ERROR: timed out waiting for the grid. Nothing imported.")
             return None
-        return run_import(importer, eligible)
+        return run_import(importer, eligible,
+                          trial_first=(getattr(args, 'age_group', 'M1') == "M2"))
     finally:
         client.close()
     # Firefox is left running so the user can review the result.
@@ -1114,12 +1533,14 @@ def run_with_chrome(args: argparse.Namespace, eligible: List[Dict]) -> Optional[
             )
 
         page = context.pages[0] if context.pages else context.new_page()
-        importer = Importer(page, dry_run=args.dry_run)
+        age_group = getattr(args, 'age_group', 'M1')
+        importer = Importer(page, dry_run=args.dry_run, age_group=age_group,
+                            exam_date=getattr(args, 'exam_date', None))
         try:
             if not importer.wait_for_login():
                 print("ERROR: timed out waiting for the grid. Nothing imported.")
                 return None
-            return run_import(importer, eligible)
+            return run_import(importer, eligible, trial_first=(age_group == "M2"))
         finally:
             context.close()
 
@@ -1225,7 +1646,14 @@ def interactive_main() -> None:
     print("  Chỉ THÊM MỚI, tự bỏ qua trẻ đã có. Không sửa/xóa hồ sơ nào.")
     print("=" * 68 + "\n")
 
-    action = _ask("Bạn muốn làm gì?", {
+    # --- Chọn đối tượng khám (M1 / M2) ---
+    age_choice = _ask("Chọn đối tượng khám:", {
+        "1": "Khám định kỳ → Trẻ dưới 6 tuổi (M1)",
+        "2": "Khám định kỳ → TRẺ TỪ 6 - 17 TUỔI (M2)",
+    }, default="1")
+    age_group = "M2" if age_choice == "2" else "M1"
+
+    action = _ask("\nBạn muốn làm gì?", {
         "1": "Nhập danh sách từ file (Excel / PDF / JSON)",
         "2": "Tạo file Excel mẫu để điền danh sách",
     }, default="1")
@@ -1245,9 +1673,18 @@ def interactive_main() -> None:
     if not os.path.exists(path):
         raise SystemExit(f"Không thấy file: {path}")
 
+    today = datetime.now().strftime("%d/%m/%Y")
+    exam_date = today
+    if age_group == "M2":
+        typed = input(f"\nNgày khám (Enter = {today}, cố định cho cả lần chạy): ").strip()
+        if typed:
+            exam_date = typed
+        print(f"Ngày khám dùng cho mọi bản: {exam_date}")
+
     args = argparse.Namespace(
         browser="chrome", dry_run=False, limit=None,
         separate_profile=False, selftest=False, file=path, make_template=False,
+        age_group=age_group, exam_date=exam_date, check_file=None,
     )
 
     browser = _ask("\nDùng trình duyệt nào?", {
@@ -1266,13 +1703,21 @@ def interactive_main() -> None:
     }, default="1")
     args.dry_run = mode == "2"
 
+    if age_group == "M2":
+        print("\n" + "=" * 68)
+        print("  CHẾ ĐỘ M2: Sẽ nhập 1 bản thử trước, hỏi xác nhận rồi mới tiếp.")
+        print("=" * 68)
+
     print()
     run(args)
 
 
 def run(args: argparse.Namespace) -> None:
     """Load the list and run the import with the chosen browser."""
-    eligible, no_ward = load_records(args.limit, args.dry_run, path=args.file)
+    eligible, no_ward, no_guardian = load_records(
+        args.limit, args.dry_run, path=args.file,
+        age_group=getattr(args, "age_group", "M1"),
+    )
 
     if args.browser == "firefox":
         results = run_with_firefox(args, eligible)
@@ -1283,7 +1728,25 @@ def run(args: argparse.Namespace) -> None:
 
     if results is None:
         return
-    print_summary(results, no_ward, args.dry_run)
+    print_summary(results, no_ward, args.dry_run, no_guardian=no_guardian)
+
+
+def check_file(path: str) -> None:
+    """Parse a list file and print a summary -- no browser, for a quick sanity check."""
+    if not os.path.exists(path):
+        raise SystemExit(f"Không thấy file: {path}")
+    data = parsers.load_any(path)
+    no_ward = [r for r in data if not r.get("ward")]
+    no_cccd = [r for r in data if not r.get("child_cccd")]
+    print(f"\nĐọc được {len(data)} hồ sơ từ {os.path.basename(path)}.")
+    print(f"  Thiếu Phường/Xã (sẽ bỏ qua khi nhập): {len(no_ward)}")
+    print(f"  Thiếu CCCD trẻ: {len(no_cccd)}")
+    print("\n3 dòng đầu:")
+    for r in data[:3]:
+        print(f"  TT{r.get('tt')}: {r.get('child_name')} | {r.get('dob')} | "
+              f"{r.get('child_cccd')} | {r.get('ward')} | lớp {r.get('lop')}")
+    for r in no_cccd[:5]:
+        print(f"  ⚠ thiếu CCCD: TT{r.get('tt')} {r.get('child_name')}")
 
 
 def main() -> None:
@@ -1296,6 +1759,10 @@ def main() -> None:
 
     if args.selftest:
         run_selftest()
+        return
+
+    if args.check_file:
+        check_file(args.check_file)
         return
 
     if args.make_template:

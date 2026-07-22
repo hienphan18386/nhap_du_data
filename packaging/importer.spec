@@ -11,6 +11,7 @@ import glob
 import os
 
 import playwright
+from PyInstaller.utils.hooks import collect_all
 
 # Paths in a spec resolve against the spec's own folder (SPECPATH), not the CWD.
 ROOT = os.path.dirname(SPECPATH)
@@ -19,7 +20,19 @@ ROOT = os.path.dirname(SPECPATH)
 # node driver included) during Analysis.
 datas = []
 binaries = []
-hiddenimports = []
+hiddenimports = ["openpyxl", "pypdf"]
+
+# openpyxl pulls parts of itself in lazily; make sure the whole package rides along
+# so reading .xlsx lists works in the frozen build. (pypdf is pure-python and found
+# by the import scan, but collecting it too costs nothing.)
+for pkg in ("openpyxl", "pypdf", "et_xmlfile"):
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    except Exception:
+        pass
 
 # The bundled hook misses the node driver's package.json files, so the driver dies
 # with "Cannot find module './../../package.json'" when it reads its own version.

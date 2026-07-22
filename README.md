@@ -62,14 +62,28 @@ Các bước — **chỉ cần bấm đúp, không cần gõ lệnh**:
 medinet-importer                            # bấm đúp = menu + hộp thoại chọn file
 medinet-importer --file danhsach.xlsx       # chỉ định file, Chrome thật (macOS)
 medinet-importer --file ds.pdf --browser firefox
+medinet-importer --age-group m2             # nhập luồng Trẻ 6–17 tuổi (M2)
 medinet-importer --make-template            # tạo mau_danh_sach.xlsx rồi thoát
 medinet-importer --separate-profile         # hồ sơ riêng biệt, đăng nhập 1 lần
 medinet-importer --dry-run --limit 3        # chạy thử 3 hồ sơ, KHÔNG lưu
+medinet-importer --check-file ds.xlsx       # kiểm tra đọc file (không mở trình duyệt)
 medinet-importer --selftest                 # kiểm tra máy (không mở trình duyệt)
 ```
 
-> `--selftest` xác nhận tìm thấy Chrome/Firefox và bộ chạy hoạt động, không mở
-> cửa sổ nào — dùng để kiểm tra nhanh trước khi nhập thật.
+> `--check-file` và `--selftest` không mở cửa sổ nào — dùng để kiểm tra nhanh
+> file dữ liệu / môi trường trước khi nhập thật.
+
+### Đối tượng khám: M1 và M2
+
+Khi bấm đúp, menu đầu tiên cho chọn đối tượng khám:
+
+- **[1] Trẻ dưới 6 tuổi (M1)** — luồng mầm non.
+- **[2] TRẺ TỪ 6–17 TUỔI (M2)** — luồng tiểu học/THCS/THPT (form khác của medinet).
+
+> **M2 luôn chạy "bản thử" trước:** công cụ nhập **1 học sinh đầu tiên**, hiện kết
+> quả (tên, CCCD, trường, lớp) rồi hỏi *"Tiếp tục nhập hết? (y/n)"*. Bấm `y` mới
+> chạy tiếp phần còn lại, `n` để dừng. Đây là bước bắt buộc để bạn kiểm tra form
+> M2 điền đúng trước khi nhập hàng loạt.
 
 > **macOS**: lần đầu có thể bị chặn "unidentified developer" → chuột phải → *Open*,
 > hoặc *System Settings → Privacy & Security → Open Anyway*.

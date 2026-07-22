@@ -30,15 +30,18 @@ WARD_PATTERNS = [
     ("chợ quán", "Phường Chợ Quán"),
     ("hiệp bình", "Phường Hiệp Bình"),
     ("nhà bè", "Xã Nhà Bè"),
+    ("nhà bẻ", "Xã Nhà Bè"),  # typo in source lists
     ("bình hưng", "Xã Bình Hưng"),
     ("hòa hưng", "Phường Hòa Hưng"),
     ("phú thuận", "Phường Phú Thuận"),
+    ("tân thuận", "Phường Tân Thuận"),
+    ("tân hưng", "Phường Tân Hưng"),
 ]
 
 
 def extract_ward(address: str) -> Optional[str]:
     """Resolve the ward from a free-text address, or None if unclear."""
-    addr = (address or "").lower()
+    addr = unicodedata.normalize("NFC", (address or "")).lower()
     for needle, ward in WARD_PATTERNS:
         if needle in addr:
             return ward
@@ -65,6 +68,25 @@ def _fold(text: str) -> str:
     text = unicodedata.normalize("NFD", str(text or ""))
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return text.lower().replace("đ", "d").strip()
+
+
+def _clean(value) -> str:
+    """Collapse embedded newlines/tabs/runs of spaces to single spaces.
+
+    Excel cells often carry line breaks ('Trường\nMầm non 12') or double spaces;
+    left in, they break the form's dropdown text matching and value comparisons.
+    """
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def normalize_ward(value: str) -> str:
+    """Map a bare ward name ('Xóm Chiếu') to the dropdown's full label.
+
+    The site's Phường/Xã dropdown matches on the exact label ('Phường Xóm Chiếu'),
+    so a source column that only gives 'Xóm Chiếu' must be expanded or it selects
+    nothing. Unknown wards are returned unchanged so nothing is silently dropped.
+    """
+    return extract_ward(value) or _clean(value)
 
 
 # Excel header -> record key, matched on the folded header *containing* the token.
@@ -147,23 +169,32 @@ def _finish_record(raw: Dict, tt_fallback: int) -> Dict:
     """Normalize one raw row into the importer's record shape."""
     rec = {
         "tt": int(raw.get("tt") or tt_fallback),
-        "child_name": str(raw.get("child_name") or "").strip(),
+        "child_name": _clean(raw.get("child_name")),
         "gender": "Nam" if _fold(raw.get("gender")) == "nam" else "Nữ",
         "dob": normalize_dob(raw.get("dob") or ""),
         "child_cccd": re.sub(r"\D", "", str(raw.get("child_cccd") or "")),
         "bhyt": re.sub(r"\D", "", str(raw.get("bhyt") or "")),
-        "address": str(raw.get("address") or "").strip(),
-        "mother_name": str(raw.get("mother_name") or "").strip(),
+        "address": _clean(raw.get("address")),
+        "mother_name": _clean(raw.get("mother_name")),
         "mother_cccd": re.sub(r"\D", "", str(raw.get("mother_cccd") or "")),
         "phone": re.sub(r"\D", "", str(raw.get("phone") or "")),
-        "school_name": str(raw.get("school_name") or "").strip(),
-        "school_address": str(raw.get("school_address") or "").strip(),
-        "school_ward": str(raw.get("school_ward") or "").strip(),
-        "lop": str(raw.get("lop") or "").strip(),
+        "school_name": _clean(raw.get("school_name")),
+        "school_address": _clean(raw.get("school_address")),
+        "school_ward": _clean(raw.get("school_ward")),
+        "lop": _clean(raw.get("lop")),
     }
-    ward = str(raw.get("ward") or "").strip()
-    rec["ward"] = ward or extract_ward(rec["address"])
-    rec["school_ward"] = rec["school_ward"] or extract_ward(rec["school_address"]) or ""
+    ward = _clean(raw.get("ward"))
+    # Normalize the ward to the dropdown's full label ("Xóm Chiếu" -> "Phường Xóm
+    # Chiếu"); fall back to the child's / school's address when the column is blank.
+    rec["ward"] = normalize_ward(ward) if ward else extract_ward(rec["address"])
+    rec["school_ward"] = (
+        (normalize_ward(rec["school_ward"]) if rec["school_ward"] else "")
+        or extract_ward(rec["school_address"])
+        or ""
+    )
+    # A mother CCCD of all zeros means "no CCCD" in these lists -- treat as empty.
+    if rec["mother_cccd"] and set(rec["mother_cccd"]) == {"0"}:
+        rec["mother_cccd"] = ""
     # Excel keeps leading zeros only in text cells; phone numbers start with 0.
     if rec["phone"] and not rec["phone"].startswith("0"):
         rec["phone"] = "0" + rec["phone"]
@@ -205,7 +236,10 @@ def parse_excel(path: str) -> List[Dict]:
         child_name = str(raw.get("child_name") or "").strip()
         if not child_name or not any(ch.isalpha() for ch in child_name):
             continue  # blank / spacer row
-        records.append(_finish_record(raw, tt_fallback=len(records) + 1))
+        try:
+            records.append(_finish_record(raw, tt_fallback=len(records) + 1))
+        except ValueError as exc:
+            print(f"  Bỏ qua 1 dòng Excel không đọc được: {exc}")
     if not records:
         raise SystemExit(
             "Không đọc được dòng học sinh nào từ file Excel này.\n"
