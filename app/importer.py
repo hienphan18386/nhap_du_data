@@ -110,6 +110,7 @@ M2_DOITUONGKHAM = "Trường Học"  # địa điểm khám
 M2_QUANHE_GIAMHO = "Mẹ"
 M2_CHITRA = "Ngân sách thành phố hỗ trợ"       # .HinhThucChiTraKhamSK
 M2_CHITRA_CHITIET = "Khám theo hợp đồng"       # .HinhThucChiTraKhamSK_ChiTiet
+M2_LYDO = "Định kỳ"                            # .LyDoKhamSK (textbox chữ tự do)
 
 
 def js_string(value: str) -> str:
@@ -625,15 +626,38 @@ class Importer:
         }})()""")
         time.sleep(0.8)
 
+        # A plain el.click() updates the calendar's display but does NOT commit the
+        # value DevExtreme actually saves (same reason radios need a pointer sequence).
+        # So select the cell with the full pointer/mouse sequence.
+        click_dx = """
+            function clickDx(el) {
+                if (!el) return;
+                const r = el.getBoundingClientRect();
+                const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                const o = { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse',
+                            isPrimary: true, button: 0, buttons: 1, clientX: cx, clientY: cy };
+                el.dispatchEvent(new PointerEvent('pointerdown', o));
+                el.dispatchEvent(new MouseEvent('mousedown', o));
+                if (typeof el.focus === 'function') el.focus();
+                el.dispatchEvent(new PointerEvent('pointerup', { ...o, buttons: 0 }));
+                el.dispatchEvent(new MouseEvent('mouseup', { ...o, buttons: 0 }));
+                el.dispatchEvent(new MouseEvent('click', { ...o, buttons: 0 }));
+            }
+        """
         for _ in range(24):  # at most ~2 years of paging
             res = self.run_js(f"""
                 (function() {{
+                    {click_dx}
                     const target = {js_string(iso)};
                     const cal = document.querySelector('.dx-calendar');
                     if (!cal) return 'no-cal';
                     const cell = cal.querySelector('.dx-calendar-cell[data-value="' + target + '"]');
                     if (cell && !cell.classList.contains('dx-calendar-other-view')) {{
-                        cell.click();
+                        // The already-selected cell is already the committed value; a
+                        // click could toggle it OFF (blank date) when the exam date
+                        // equals the form's default, so leave it untouched.
+                        if (cell.classList.contains('dx-calendar-selected-date')) return 'ok';
+                        clickDx(cell);
                         return 'ok';
                     }}
                     const main = Array.from(cal.querySelectorAll('.dx-calendar-cell:not(.dx-calendar-other-view)'))
@@ -641,12 +665,12 @@ class Importer:
                     if (!main.length) return 'no-cells';
                     if (target < main[0]) {{
                         const p = cal.querySelector('.dx-calendar-navigator-previous-view');
-                        if (p) {{ p.click(); return 'paged'; }}
+                        if (p) {{ clickDx(p); return 'paged'; }}
                     }} else if (target > main[main.length - 1]) {{
                         const n = cal.querySelector('.dx-calendar-navigator-next-view');
-                        if (n) {{ n.click(); return 'paged'; }}
+                        if (n) {{ clickDx(n); return 'paged'; }}
                     }} else if (cell) {{
-                        cell.click();
+                        clickDx(cell);
                         return 'ok';
                     }}
                     return 'stuck';
@@ -654,6 +678,15 @@ class Importer:
             """)
             if res == "ok":
                 time.sleep(0.4)
+                # Close the dropdown to force the widget to commit its picked value.
+                self.run_js(f"""(function() {{
+                    if (document.querySelector('.dx-calendar')) {{
+                        const b = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
+                        if (b) b.click();
+                    }}
+                    return true;
+                }})()""")
+                time.sleep(0.3)
                 return True
             if res in ("no-cal", "no-cells", "stuck"):
                 break
@@ -818,6 +851,7 @@ class Importer:
             ".BHYT": bhyt,
             ".SDT": phone,
             ".DiaChiHienTai": r["address"],
+            ".LyDoKhamSK": M2_LYDO,
             ".TreEm_NguoiGiamHo": r["mother_name"],
             ".TreEm_SDT_NguoiGiamHo": phone,
         }
@@ -922,6 +956,12 @@ class Importer:
             record_id = self.current_record_id()
             if record_id:
                 print(f"  saved (phieukhamId={record_id})")
+                # A newly created M2 record is always stamped with today's date -- the
+                # create form forces NgayKham = now and no synthetic event can change it.
+                # The exam date only sticks when set on an EXISTING record, so reopen it
+                # in edit mode and fix ONLY Ngày khám (leaving every other field alone).
+                if self.age_group == "M2" and self._exam_date_needs_edit():
+                    self.correct_exam_date(r)
                 return "success"
 
             is_duplicate = self.run_js("""
@@ -954,6 +994,88 @@ class Importer:
         for message in messages:
             print(f"    form says: {message}")
         return "failed"
+
+    def _exam_date_needs_edit(self) -> bool:
+        """Create-mode always stamps today, so only reopen-to-edit when the target
+        exam date differs from the machine's current date (e.g. an overnight batch)."""
+        return self.exam_date != datetime.now().strftime("%d/%m/%Y")
+
+    def _grid_exam_date(self, cccd: str) -> Optional[str]:
+        """Read the NGÀY KHÁM cell (index 8) for the row with this CCCD, or None."""
+        return self.run_js(f"""
+            (function() {{
+                const rows = Array.from(document.querySelectorAll('.dx-datagrid .dx-data-row'));
+                for (const tr of rows) {{
+                    const cells = Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim());
+                    if (cells.includes({js_string(cccd)})) return cells[8] || null;
+                }}
+                return null;
+            }})()
+        """)
+
+    def open_edit_from_grid(self, cccd: str, timeout_s: int = 40) -> bool:
+        """From the grid, click the edit pen for the row with this CCCD and wait for
+        the populated form to load bound to that CCCD. Add-only safe: it edits the row
+        we just created, matched by CCCD, and verifies the loaded CCCD before returning."""
+        if not self.open_list(timeout_s):
+            return False
+        time.sleep(1.5)
+        clicked = self.run_js(f"""
+            (function() {{
+                function clickDx(el) {{
+                    const r = el.getBoundingClientRect();
+                    const o = {{bubbles:true,cancelable:true,pointerId:1,pointerType:'mouse',
+                                isPrimary:true,button:0,buttons:1,clientX:r.left+r.width/2,clientY:r.top+r.height/2}};
+                    el.dispatchEvent(new PointerEvent('pointerdown', o));
+                    el.dispatchEvent(new MouseEvent('mousedown', o));
+                    el.dispatchEvent(new PointerEvent('pointerup', {{...o, buttons:0}}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {{...o, buttons:0}}));
+                    el.dispatchEvent(new MouseEvent('click', {{...o, buttons:0}}));
+                }}
+                const rows = Array.from(document.querySelectorAll('.dx-datagrid .dx-data-row'));
+                for (const tr of rows) {{
+                    const cells = Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim());
+                    if (cells.includes({js_string(cccd)})) {{
+                        const pen = tr.querySelector('i.fa-pen, i.fas.fa-pen, .fa-pen');
+                        if (pen) {{ clickDx(pen); return 'ok'; }}
+                        return 'no-pen';
+                    }}
+                }}
+                return 'row-not-found';
+            }})()
+        """)
+        if clicked != "ok":
+            print(f"  không mở được bản sửa ({clicked})")
+            return False
+        for _ in range(timeout_s):
+            time.sleep(1.0)
+            loaded = self.run_js("(function(){var c=document.querySelector('.DinhDanhCaNhan input');return c?c.value:null;})()")
+            if loaded == cccd:
+                return True
+        print("  form sửa không nạp đúng CCCD -- bỏ, không lưu")
+        return False
+
+    def correct_exam_date(self, r: Dict[str, str]) -> bool:
+        """Reopen the just-created record in edit mode and set ONLY Ngày khám to the
+        run's exam date. Every other field is left exactly as saved."""
+        cccd = r["child_cccd"]
+        if not self.open_edit_from_grid(cccd):
+            print("  ! không sửa được ngày khám (giữ ngày mặc định hôm nay)")
+            return False
+        if not self.set_datebox(".NgayKham", self.exam_date):
+            print("  ! đặt ngày khám thất bại khi sửa")
+            return False
+        self.click_save()
+        time.sleep(5.0)
+        # Confirm on the grid that the date actually changed.
+        if self.open_list(30):
+            time.sleep(1.0)
+            got = self._grid_exam_date(cccd)
+            if got == self.exam_date:
+                print(f"  ngày khám đã sửa -> {self.exam_date}")
+                return True
+            print(f"  ! ngày khám sau sửa là {got!r}, mong đợi {self.exam_date!r}")
+        return False
 
 
 def parse_args() -> argparse.Namespace:
