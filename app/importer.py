@@ -1371,6 +1371,7 @@ class AppleScriptImporter(Importer):
                  exam_date: Optional[str] = None):
         super().__init__(page=None, dry_run=dry_run, age_group=age_group, exam_date=exam_date)
         self._prompted_js_setting = False
+        self._initial_activate_done = False
 
     @staticmethod
     def _osascript(script: str) -> "subprocess.CompletedProcess":
@@ -1384,7 +1385,20 @@ class AppleScriptImporter(Importer):
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
     def goto(self, url: str) -> None:
-        """Point the medinet tab (or a new tab) at url in the user's own Chrome."""
+        """Point the medinet tab (or a new tab) at url in the user's own Chrome.
+
+        The very first call uses AppleScript with ``activate`` to ensure Chrome
+        is running and the medinet tab exists.  Every call after that navigates
+        via JavaScript (``location.assign``) executed through ``run_js``, which
+        talks to the *existing* tab without bringing Chrome to the foreground.
+        This lets the user keep working in another app while the batch runs.
+        """
+        if self._initial_activate_done:
+            # Navigate via JS -- no AppleScript window manipulation, no focus steal.
+            self.run_js(f"location.assign({js_string(url)})")
+            return
+
+        # First call: open/find the tab, activate Chrome so it is visible once.
         self._osascript(f"""
 tell application "Google Chrome"
     activate
@@ -1405,6 +1419,7 @@ tell application "Google Chrome"
     end if
 end tell
 """)
+        self._initial_activate_done = True
 
     def run_js(self, code: str):
         """Evaluate a JS expression in the medinet tab and JSON-decode the result.

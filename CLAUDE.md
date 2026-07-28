@@ -101,6 +101,31 @@ medinet form (except final saved-date confirmation, which waits for new data).
   Run overnight or in chunks with `--limit`. Packaged app rebuilt with all of the
   above. Deeper detail lives in the `m2-form-quirks` memory file.
 
+### 0c. TH Xóm Chiếu (24/07/2026) — Excel Fix + Chrome Focus Fix
+* **Excel school name corrected**: The file
+  `/Users/hienphantrong/Downloads/Danh sach truong xom chieu kham ngay 24.7.2026.xlsx`
+  (441 students, classes 1/1–5/4) had column "Nơi đang theo học" set to
+  `Trường TH Xóm Chiếu`. The Medinet lookup expects the exact option text
+  `TH Xóm Chiếu - Phường Xóm Chiếu`. All 441 cells in column J (row 10+) were
+  updated directly in the `.xlsx` file via openpyxl.
+* **Parser verification**: `parsers.load_any()` successfully reads all 441 records
+  with `school_name='TH Xóm Chiếu - Phường Xóm Chiếu'`,
+  `school_ward='Phường Xóm Chiếu'`. 72 records have `ward=None` because their
+  home addresses use old ward names (Phường 10, 14, 13, 15, 16) or other
+  districts.
+* **Chrome focus-stealing fixed** (`app/importer.py`,
+  `AppleScriptImporter.goto()`): During batch import, every call to
+  `open_new_form()` → `open_list()` → `goto(list_url)` previously used
+  AppleScript `set URL of t` which brought Chrome to the foreground, disrupting
+  the user working in another app. Fix: after the very first `goto()` (which
+  still uses AppleScript `activate` to launch Chrome), all subsequent navigations
+  use **JavaScript `location.assign(url)`** via `run_js()`. Since `run_js()`
+  only executes JS in the existing tab without any window-level AppleScript
+  commands, Chrome stays in the background. Controlled by the
+  `_initial_activate_done` flag on `AppleScriptImporter`.
+* **Rebuilt packaged app**: `pyinstaller packaging/importer.spec` →
+  `dist/medinet-importer` includes both fixes.
+
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.
 * **Impact**: The original importer script checked `is_form_still_open` using `.TienSu_TX_NguoiBenhLao`. Because the form stayed open (but was blank), it timed out after 15 seconds, concluding the save failed and creating duplicates during re-runs.
