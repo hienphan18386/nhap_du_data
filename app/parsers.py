@@ -1,7 +1,7 @@
 """Read a children list from Excel (.xlsx), PDF (.pdf) or JSON (.json).
 
 Every parser returns the record shape the importer fills forms with:
-    tt, child_name, gender, dob, child_cccd, bhyt, address, ward,
+    tt, child_name, gender, dob, exam_date, child_cccd, bhyt, address, ward,
     mother_name, mother_cccd, phone, school_name, school_address,
     school_ward, lop
 
@@ -96,6 +96,8 @@ _HEADER_TOKENS = [
     ("cccd cua me", "mother_cccd"),
     ("cccd nguoi giam ho", "mother_cccd"),
     ("cccd cua nguoi giam ho", "mother_cccd"),
+    ("nguoi giam ho cccd", "mother_cccd"),
+    ("nguoi giam ho sdt", "phone"),
     ("ma dinh danh me", "mother_cccd"),
     ("ho ten me", "mother_name"),
     ("ten me", "mother_name"),
@@ -106,23 +108,27 @@ _HEADER_TOKENS = [
     ("phuong/xa cua truong", "school_ward"),
     ("phuong xa cua truong", "school_ward"),
     ("phuong/xa truong", "school_ward"),
+    ("truong phuong xa", "school_ward"),
     ("noi hoc/noi lam viec", "school_ward"),
     ("noi hoc noi lam viec", "school_ward"),
     ("noi dang theo hoc", "school_name"),
     ("noi dang lam viec", "school_name"),
     ("ten truong", "school_name"),
     ("dia chi", "address"),
+    ("cho o hien tai", "address"),
     ("phuong", "ward"),
     ("xa", "ward"),
     ("ho va ten", "child_name"),
     ("ho ten", "child_name"),
     ("ten tre", "child_name"),
     ("gioi tinh", "gender"),
+    ("ngay kham", "exam_date"),
     ("ngay thang nam sinh", "dob"),
     ("ngay sinh", "dob"),
     ("cccd", "child_cccd"),
     ("ma dinh danh", "child_cccd"),
     ("bhyt", "bhyt"),
+    ("bao hiem y te", "bhyt"),
     ("dien thoai", "phone"),
     ("sdt", "phone"),
     ("lop", "lop"),
@@ -172,6 +178,11 @@ def _finish_record(raw: Dict, tt_fallback: int) -> Dict:
         "child_name": _clean(raw.get("child_name")),
         "gender": "Nam" if _fold(raw.get("gender")) == "nam" else "Nữ",
         "dob": normalize_dob(raw.get("dob") or ""),
+        "exam_date": (
+            normalize_dob(raw.get("exam_date"))
+            if raw.get("exam_date")
+            else ""
+        ),
         "child_cccd": re.sub(r"\D", "", str(raw.get("child_cccd") or "")),
         "bhyt": re.sub(r"\D", "", str(raw.get("bhyt") or "")),
         "address": _clean(raw.get("address")),
@@ -209,22 +220,22 @@ def parse_excel(path: str) -> List[Dict]:
     if not rows:
         raise SystemExit(f"File Excel rỗng: {path}")
 
-    # Find the header row: the first row matching at least 4 known columns.
+    # Find the strongest header row. Medinet templates have a human header on
+    # row 2 and a more complete machine header (HO_TEN, NGAY_SINH...) on row 4.
     header_idx, mapping = None, {}
     for idx, row in enumerate(rows[:10]):
         found = {}
         for col, cell in enumerate(row):
-            folded = _fold(cell)
+            folded = _fold(cell).replace("_", " ")
             if not folded:
                 continue
             for token, key in _HEADER_TOKENS:
                 if token in folded and key not in found:
                     found[key] = col
                     break
-        if len(found) >= 4:
+        if len(found) > len(mapping):
             header_idx, mapping = idx, found
-            break
-    if header_idx is None:
+    if header_idx is None or len(mapping) < 4:
         raise SystemExit(
             "Không nhận ra dòng tiêu đề trong file Excel.\n"
             "Hãy dùng file mẫu (chạy công cụ và chọn 'Tạo file Excel mẫu')."
@@ -236,6 +247,9 @@ def parse_excel(path: str) -> List[Dict]:
         child_name = str(raw.get("child_name") or "").strip()
         if not child_name or not any(ch.isalpha() for ch in child_name):
             continue  # blank / spacer row
+        technical_name = _fold(child_name).replace("_", " ")
+        if technical_name in {"ho ten", "ho va ten", "ho ten tre"}:
+            continue  # Medinet's machine-readable header row (HO_TEN, NGAY_SINH...)
         try:
             records.append(_finish_record(raw, tt_fallback=len(records) + 1))
         except ValueError as exc:

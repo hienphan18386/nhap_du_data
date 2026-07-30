@@ -32,6 +32,7 @@ beside the executable and writing import_results.json there.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -40,6 +41,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -47,10 +49,11 @@ from typing import Dict, List, Optional
 # stdlib Marionette) works even where Playwright is not installed.
 try:
     from app.marionette import DEFAULT_HOST, DEFAULT_PORT, Marionette, MarionetteError
-    from app import parsers
+    from app import parsers, workbook_repair
 except ImportError:  # frozen / run as a loose script, no package parent
     from marionette import DEFAULT_HOST, DEFAULT_PORT, Marionette, MarionetteError
     import parsers
+    import workbook_repair
 
 ROOT_URL = "https://quanlyskcd.medinet.org.vn/"
 
@@ -116,6 +119,30 @@ M2_LYDO = "Định kỳ"                            # .LyDoKhamSK (textbox chữ
 def js_string(value: str) -> str:
     """Embed a Python string into a JS source literal safely (names contain quotes/diacritics)."""
     return json.dumps(value, ensure_ascii=False)
+
+
+def is_duplicate_notice(messages: List[str]) -> bool:
+    """True when Medinet says this person was imported or already exists."""
+    folded = " ".join(
+        "".join(
+            ch
+            for ch in unicodedata.normalize("NFD", str(message))
+            if unicodedata.category(ch) != "Mn"
+        ).replace("đ", "d").replace("Đ", "D").lower()
+        for message in messages
+    )
+    return any(
+        marker in folded
+        for marker in (
+            "da nhap",
+            "da ton tai",
+            "da co",
+            "bi trung",
+            "trung du lieu",
+            "duplicate",
+            "already exists",
+        )
+    )
 
 
 def valid_bhyt(value: str) -> str:
@@ -837,10 +864,10 @@ class Importer:
         guardian_cccd = r.get("mother_cccd") or ""  # already blanked if it was all zeros
         phone = r.get("phone", "")
 
-        # Force the exam date to the run's fixed value (not the form's shifting default),
-        # so an overnight batch keeps one exam date throughout. Via the calendar, because
-        # typing into this pre-filled datebox does not commit the saved value.
-        self.set_datebox(".NgayKham", self.exam_date)
+        # Native Medinet workbooks carry NGAY_KHAM per row. Simpler list files use
+        # the run-level date captured at startup.
+        target_exam_date = r.get("exam_date") or self.exam_date
+        self.set_datebox(".NgayKham", target_exam_date)
 
         # Personal + guardian text fields. The guardian is the child's mother in these
         # lists; the same phone stands in for the child's own SĐT (required, no column).
@@ -960,19 +987,30 @@ class Importer:
                 # create form forces NgayKham = now and no synthetic event can change it.
                 # The exam date only sticks when set on an EXISTING record, so reopen it
                 # in edit mode and fix ONLY Ngày khám (leaving every other field alone).
-                if self.age_group == "M2" and self._exam_date_needs_edit():
+                if self.age_group == "M2" and self._exam_date_needs_edit(r):
                     self.correct_exam_date(r)
                 return "success"
 
             is_duplicate = self.run_js("""
                 (function() {
-                    const title = document.querySelector('.dx-popup-title');
-                    if (!title) return false;
-                    const txt = title.innerText.toUpperCase();
-                    if (txt.includes('TRÙNG') || txt.includes('TỒN TẠI') || txt.includes('ĐÃ CÓ') || txt.includes('CCCD')) {
-                        const x = document.querySelector('.dx-popup-cancel-button, .dx-close-button, [aria-label="Close"], .dx-popup-title .dx-button');
-                        if (x) x.click();
-                        return true;
+                    const popups = Array.from(document.querySelectorAll(
+                        '.dx-popup-wrapper:not(.dx-state-invisible), .dx-toast-wrapper'
+                    ));
+                    const markers = [
+                        'da nhap', 'da ton tai', 'da co', 'bi trung',
+                        'trung du lieu', 'duplicate', 'already exists'
+                    ];
+                    for (const popup of popups) {
+                        const txt = (popup.innerText || '').normalize('NFD')
+                            .replace(/[\\u0300-\\u036f]/g, '')
+                            .replace(/đ/g, 'd').replace(/Đ/g, 'D').toLowerCase();
+                        if (markers.some(marker => txt.includes(marker))) {
+                            const x = popup.querySelector(
+                                '.dx-popup-cancel-button, .dx-close-button, [aria-label="Close"], .dx-popup-title .dx-button'
+                            );
+                            if (x) x.click();
+                            return true;
+                        }
                     }
                     return false;
                 })()
@@ -986,6 +1024,10 @@ class Importer:
         # refused it -- which for M2 means this CCCD is already on file (it never makes
         # a duplicate). A form that IS complaining is a genuine fill problem.
         messages = self.validation_messages()
+        if is_duplicate_notice(messages):
+            print("  Medinet báo hồ sơ đã nhập/đã tồn tại -> bỏ qua, tiếp tục")
+            self.click_back()
+            return "duplicate"
         if not messages:
             print("  không tạo phiếu mới và form không báo lỗi -> có thể đã nhập trước đó, bỏ qua")
             self.click_back()
@@ -995,10 +1037,11 @@ class Importer:
             print(f"    form says: {message}")
         return "failed"
 
-    def _exam_date_needs_edit(self) -> bool:
+    def _exam_date_needs_edit(self, r: Dict[str, str]) -> bool:
         """Create-mode always stamps today, so only reopen-to-edit when the target
         exam date differs from the machine's current date (e.g. an overnight batch)."""
-        return self.exam_date != datetime.now().strftime("%d/%m/%Y")
+        target_exam_date = r.get("exam_date") or self.exam_date
+        return target_exam_date != datetime.now().strftime("%d/%m/%Y")
 
     def _grid_exam_date(self, cccd: str) -> Optional[str]:
         """Read the NGÀY KHÁM cell (index 8) for the row with this CCCD, or None."""
@@ -1057,12 +1100,13 @@ class Importer:
 
     def correct_exam_date(self, r: Dict[str, str]) -> bool:
         """Reopen the just-created record in edit mode and set ONLY Ngày khám to the
-        run's exam date. Every other field is left exactly as saved."""
+        row's exam date. Every other field is left exactly as saved."""
         cccd = r["child_cccd"]
+        target_exam_date = r.get("exam_date") or self.exam_date
         if not self.open_edit_from_grid(cccd):
             print("  ! không sửa được ngày khám (giữ ngày mặc định hôm nay)")
             return False
-        if not self.set_datebox(".NgayKham", self.exam_date):
+        if not self.set_datebox(".NgayKham", target_exam_date):
             print("  ! đặt ngày khám thất bại khi sửa")
             return False
         self.click_save()
@@ -1071,10 +1115,10 @@ class Importer:
         if self.open_list(30):
             time.sleep(1.0)
             got = self._grid_exam_date(cccd)
-            if got == self.exam_date:
-                print(f"  ngày khám đã sửa -> {self.exam_date}")
+            if got == target_exam_date:
+                print(f"  ngày khám đã sửa -> {target_exam_date}")
                 return True
-            print(f"  ! ngày khám sau sửa là {got!r}, mong đợi {self.exam_date!r}")
+            print(f"  ! ngày khám sau sửa là {got!r}, mong đợi {target_exam_date!r}")
         return False
 
 
@@ -1111,6 +1155,16 @@ def parse_args() -> argparse.Namespace:
         "--check-file",
         metavar="PATH",
         help="read a list file and print a summary, without opening any browser",
+    )
+    parser.add_argument(
+        "--repair-import-file",
+        metavar="PATH",
+        help="sửa file Excel để tải lên mục Nhập file của Medinet rồi thoát",
+    )
+    parser.add_argument(
+        "--repair-output",
+        metavar="PATH",
+        help="đường dẫn bản Excel đã sửa (mặc định: tên gốc + _DA_SUA.xlsx)",
     )
     parser.add_argument(
         "--age-group",
@@ -1356,6 +1410,10 @@ class AppleScriptJSDisabled(RuntimeError):
     """Chrome refused to run JS: 'Allow JavaScript from Apple Events' is off."""
 
 
+class BulkFileUploadError(RuntimeError):
+    """The repaired workbook could not be attached to Medinet's bulk importer."""
+
+
 class AppleScriptImporter(Importer):
     """Drives the user's real, everyday Chrome on macOS over AppleScript.
 
@@ -1471,6 +1529,191 @@ end tell
                 time.sleep(3.0)
         return False
 
+    def _bulk_import_ready(self) -> bool:
+        """Whether the M2 report has its bulk-import button and file input."""
+        return bool(self.run_js("""
+(() => {
+    const button = Array.from(document.querySelectorAll('button')).find(
+        element => (element.textContent || '').trim() === 'Nhập'
+    );
+    const input = button && button.parentElement
+        ? button.parentElement.querySelector('input#openFileGroup[type="file"]')
+        : null;
+    return Boolean(button && input);
+})()
+"""))
+
+    def _attach_bulk_file(self, path: str) -> None:
+        """Attach a local workbook in real Chrome without opening Finder.
+
+        Chrome does not let JavaScript read a local path. The app therefore reads
+        the bytes itself, stages small base64 chunks in the Medinet tab, creates a
+        browser File, and dispatches the same change event as the native picker.
+        """
+        with open(path, "rb") as workbook:
+            encoded = base64.b64encode(workbook.read()).decode("ascii")
+
+        initialized = self.run_js("""
+(() => {
+    window.__medinetBulkUpload = {
+        chunks: [],
+        started: false,
+        error: ''
+    };
+    return true;
+})()
+""")
+        if not initialized:
+            raise BulkFileUploadError("Không khởi tạo được dữ liệu tải file.")
+
+        chunk_size = 48 * 1024
+        for offset in range(0, len(encoded), chunk_size):
+            chunk = encoded[offset:offset + chunk_size]
+            staged = self.run_js(
+                "(() => {"
+                "const state = window.__medinetBulkUpload;"
+                "if (!state) return false;"
+                f"state.chunks.push({js_string(chunk)});"
+                "return true;"
+                "})()"
+            )
+            if not staged:
+                raise BulkFileUploadError("Chrome bị gián đoạn khi nhận dữ liệu file.")
+
+        filename = os.path.basename(path)
+        scheduled = self.run_js(f"""
+(() => {{
+    const state = window.__medinetBulkUpload;
+    const button = Array.from(document.querySelectorAll('button')).find(
+        element => (element.textContent || '').trim() === 'Nhập'
+    );
+    const input = button && button.parentElement
+        ? button.parentElement.querySelector('input#openFileGroup[type="file"]')
+        : null;
+    if (!state || !button || !input) return false;
+
+    const oldDialog = document.querySelector(
+        '.swal2-container.swal2-backdrop-show .swal2-confirm'
+    );
+    if (oldDialog) oldDialog.click();
+    button.click();
+
+    const deadline = Date.now() + 3000;
+    const attach = () => {{
+        try {{
+            const link = Array.from(document.querySelectorAll('a')).find(
+                element => (element.textContent || '').trim() === 'Nhập file'
+            );
+            if (!link) {{
+                if (Date.now() < deadline) {{
+                    setTimeout(attach, 100);
+                }} else {{
+                    state.error = 'Không tìm thấy mục Nhập file.';
+                }}
+                return;
+            }}
+
+            const hadOwnClick = Object.prototype.hasOwnProperty.call(input, 'click');
+            const originalClick = input.click;
+            input.click = () => {{}};
+            try {{
+                link.click();
+            }} finally {{
+                if (hadOwnClick) input.click = originalClick;
+                else delete input.click;
+            }}
+
+            const binary = atob(state.chunks.join(''));
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {{
+                bytes[index] = binary.charCodeAt(index);
+            }}
+            const file = new File(
+                [bytes],
+                {js_string(filename)},
+                {{type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}}
+            );
+            const transfer = new DataTransfer();
+            transfer.items.add(file);
+            input.files = transfer.files;
+            state.started = true;
+            state.chunks = [];
+            input.dispatchEvent(new Event('change', {{bubbles: true}}));
+        }} catch (error) {{
+            state.error = String(error && error.message ? error.message : error);
+        }}
+    }};
+    setTimeout(attach, 50);
+    return true;
+}})()
+""")
+        if not scheduled:
+            raise BulkFileUploadError("Không mở được chức năng Nhập -> Nhập file.")
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            state = self.run_js("""
+(() => {
+    const upload = window.__medinetBulkUpload;
+    return upload ? {started: upload.started, error: upload.error} : null;
+})()
+""")
+            if state and state.get("error"):
+                raise BulkFileUploadError(state["error"])
+            if state and state.get("started"):
+                return
+            time.sleep(0.2)
+        raise BulkFileUploadError("Chrome không bắt đầu gửi file lên Medinet.")
+
+    def _bulk_import_result(self):
+        """Read the SweetAlert result left by Medinet after a bulk upload."""
+        return self.run_js("""
+(() => {
+    const dialog = document.querySelector(
+        '.swal2-container.swal2-backdrop-show'
+    );
+    if (!dialog) return null;
+    const title = dialog.querySelector('.swal2-title');
+    const message = title ? (title.innerText || title.textContent || '').trim() : '';
+    return {
+        message,
+        success: Boolean(dialog.querySelector('.swal2-success')),
+        error: Boolean(dialog.querySelector('.swal2-error'))
+    };
+})()
+""")
+
+    def upload_excel_file(self, path: str, timeout_s: int = 300) -> Dict:
+        """Upload one repaired workbook through Medinet's native bulk importer."""
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+
+        ready_deadline = time.time() + 60
+        while time.time() < ready_deadline:
+            if self._bulk_import_ready():
+                break
+            time.sleep(1.0)
+        else:
+            raise BulkFileUploadError(
+                "Không tìm thấy nút Nhập file trên trang M2."
+            )
+
+        self._attach_bulk_file(path)
+
+        print("Đã chọn file đã sửa. Medinet đang xử lý...")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            result = self._bulk_import_result()
+            if result and result.get("message"):
+                return result
+            time.sleep(1.0)
+        return {
+            "message": "Đã gửi file lên Medinet nhưng chưa nhận được thông báo kết quả.",
+            "success": False,
+            "error": False,
+            "timed_out": True,
+        }
+
 
 def run_with_chrome_applescript(args: argparse.Namespace, eligible: List[Dict]) -> Optional[Dict]:
     """macOS: drive the user's real Chrome (their normal profile and login)."""
@@ -1484,7 +1727,58 @@ def run_with_chrome_applescript(args: argparse.Namespace, eligible: List[Dict]) 
     if not importer.wait_for_login():
         print("ERROR: timed out waiting for the grid. Nothing imported.")
         return None
-    return run_import(importer, eligible, trial_first=(age_group == "M2"))
+    return run_import(
+        importer,
+        eligible,
+        trial_first=(
+            age_group == "M2" and not getattr(args, "skip_trial", False)
+        ),
+    )
+
+
+def upload_repaired_file_to_medinet(path: str) -> bool:
+    """Open the M2 bulk importer in real Chrome and upload the repaired workbook."""
+    if sys.platform != "darwin":
+        print("ERROR: Tự chọn file trong Chrome hiện chỉ hỗ trợ macOS.")
+        return False
+
+    importer = AppleScriptImporter(age_group="M2")
+    importer.goto(importer.list_url)
+    if not importer.wait_for_js_permission():
+        print("ERROR: Chrome chưa cho phép JavaScript from Apple Events.")
+        return False
+    if not importer.wait_for_login():
+        print("ERROR: Hết thời gian chờ trang danh sách M2.")
+        return False
+
+    try:
+        result = importer.upload_excel_file(path)
+    except BulkFileUploadError as exc:
+        print("\nChrome thật không nhận được file qua tab đang mở.")
+        print("Chuyển sang cửa sổ Chrome riêng của app để thử lại.")
+        print(f"Chi tiết: {exc}")
+        return upload_repaired_file_with_separate_chrome(path)
+
+    return print_bulk_import_result(result)
+
+
+def print_bulk_import_result(result: Dict) -> bool:
+    """Print Medinet's bulk-import result consistently for every browser path."""
+    message = result.get("message", "").strip()
+    print("\n" + "=" * 68)
+    print(f"  KẾT QUẢ MEDINET: {message}")
+    if "file lỗi" in message.lower():
+        print("  Medinet đã xử lý file; dòng đã có/sai nằm trong file lỗi.")
+    elif result.get("success"):
+        print("  File đã được nhập thành công.")
+    elif result.get("timed_out"):
+        print("  Hãy xem thông báo đang hiển thị trên Chrome.")
+    print("=" * 68)
+    return bool(
+        result.get("success")
+        or "thành công" in message.lower()
+        or "file lỗi" in message.lower()
+    )
 
 
 # --- browser launch ---------------------------------------------------------
@@ -1626,8 +1920,14 @@ def run_with_firefox(args: argparse.Namespace, eligible: List[Dict]) -> Optional
         if not importer.wait_for_login():
             print("ERROR: timed out waiting for the grid. Nothing imported.")
             return None
-        return run_import(importer, eligible,
-                          trial_first=(getattr(args, 'age_group', 'M1') == "M2"))
+        return run_import(
+            importer,
+            eligible,
+            trial_first=(
+                getattr(args, "age_group", "M1") == "M2"
+                and not getattr(args, "skip_trial", False)
+            ),
+        )
     finally:
         client.close()
     # Firefox is left running so the user can review the result.
@@ -1677,7 +1977,90 @@ def run_with_chrome(args: argparse.Namespace, eligible: List[Dict]) -> Optional[
             if not importer.wait_for_login():
                 print("ERROR: timed out waiting for the grid. Nothing imported.")
                 return None
-            return run_import(importer, eligible, trial_first=(age_group == "M2"))
+            return run_import(
+                importer,
+                eligible,
+                trial_first=(
+                    age_group == "M2"
+                    and not getattr(args, "skip_trial", False)
+                ),
+            )
+        finally:
+            context.close()
+
+
+def upload_repaired_file_with_separate_chrome(path: str) -> bool:
+    """Upload through the app's persistent Chrome profile, without a Finder dialog."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("ERROR: Playwright không có sẵn để mở cửa sổ Chrome riêng.")
+        return False
+
+    os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+    with sync_playwright() as playwright:
+        context = None
+        last_error = None
+        for channel in ("chrome", "msedge", "chromium"):
+            try:
+                context = playwright.chromium.launch_persistent_context(
+                    CHROME_PROFILE_DIR,
+                    headless=False,
+                    channel=channel,
+                    viewport=None,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if context is None:
+            print(f"ERROR: Không mở được Chrome riêng: {last_error}")
+            return False
+
+        try:
+            pages = context.pages
+            page = pages[0] if pages else context.new_page()
+            importer = Importer(page, age_group="M2")
+            importer.goto(importer.list_url)
+            if not importer.wait_for_login():
+                print("ERROR: Hết thời gian chờ đăng nhập trên Chrome riêng.")
+                return False
+
+            old_confirm = page.locator(
+                ".swal2-container.swal2-backdrop-show .swal2-confirm"
+            )
+            if old_confirm.count() == 1 and old_confirm.is_visible():
+                old_confirm.click()
+
+            import_button = page.get_by_role("button", name="Nhập", exact=True)
+            import_button.wait_for(state="visible", timeout=30000)
+            import_button.click()
+
+            import_file = page.get_by_text("Nhập file", exact=True)
+            import_file.wait_for(state="visible", timeout=10000)
+            with page.expect_file_chooser(timeout=10000) as chooser_info:
+                import_file.click()
+            chooser_info.value.set_files(os.path.abspath(path))
+
+            print("Đã tải file đã sửa lên Medinet. Đang chờ kết quả...")
+            title = page.locator(
+                ".swal2-container.swal2-backdrop-show .swal2-title"
+            )
+            title.wait_for(state="visible", timeout=300000)
+            message = (title.inner_text() or "").strip()
+            success = page.locator(
+                ".swal2-container.swal2-backdrop-show .swal2-success"
+            ).count() == 1
+            error = page.locator(
+                ".swal2-container.swal2-backdrop-show .swal2-error"
+            ).count() == 1
+            return print_bulk_import_result({
+                "message": message,
+                "success": success,
+                "error": error,
+            })
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: Không thể tự tải file lên Medinet: {exc}")
+            return False
         finally:
             context.close()
 
@@ -1783,16 +2166,10 @@ def interactive_main() -> None:
     print("  Chỉ THÊM MỚI, tự bỏ qua trẻ đã có. Không sửa/xóa hồ sơ nào.")
     print("=" * 68 + "\n")
 
-    # --- Chọn đối tượng khám (M1 / M2) ---
-    age_choice = _ask("Chọn đối tượng khám:", {
-        "1": "Khám định kỳ → Trẻ dưới 6 tuổi (M1)",
-        "2": "Khám định kỳ → TRẺ TỪ 6 - 17 TUỔI (M2)",
-    }, default="1")
-    age_group = "M2" if age_choice == "2" else "M1"
-
-    action = _ask("\nBạn muốn làm gì?", {
+    action = _ask("Bạn muốn làm gì?", {
         "1": "Nhập danh sách từ file (Excel / PDF / JSON)",
         "2": "Tạo file Excel mẫu để điền danh sách",
+        "3": "Sửa file Excel rồi tự động nhập vào Medinet (M2)",
     }, default="1")
     if action == "2":
         target = os.path.join(BASE_DIR, "mau_danh_sach.xlsx")
@@ -1801,6 +2178,31 @@ def interactive_main() -> None:
         print("Mở file này, điền danh sách trẻ (mỗi dòng một bé), lưu lại,")
         print("rồi chạy công cụ lần nữa và chọn file đó.")
         return
+
+    if action == "3":
+        print("\nĐang mở hộp thoại chọn file Excel...")
+        # Reuse the same picker as the normal import flow. Its macOS filter is
+        # already proven to keep .xlsx selectable; a second Excel-only picker
+        # makes Finder disable valid LibreOffice-generated workbooks.
+        path = choose_file_dialog()
+        if not path:
+            print("Không chọn file nào -- thoát.")
+            return
+        if os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm"):
+            print("File đã chọn không phải Excel .xlsx/.xlsm -- thoát.")
+            return
+        repaired_path = repair_import_file(path)
+        print("\nBắt đầu tải bản đã sửa vào Medinet bằng Nhập -> Nhập file.")
+        print("Các dòng đã có/sai sẽ nằm trong file lỗi; dòng hợp lệ vẫn được nhập.")
+        upload_repaired_file_to_medinet(repaired_path)
+        return
+
+    # --- Chọn đối tượng khám (M1 / M2) ---
+    age_choice = _ask("\nChọn đối tượng khám:", {
+        "1": "Khám định kỳ → Trẻ dưới 6 tuổi (M1)",
+        "2": "Khám định kỳ → TRẺ TỪ 6 - 17 TUỔI (M2)",
+    }, default="1")
+    age_group = "M2" if age_choice == "2" else "M1"
 
     print("\nĐang mở hộp thoại chọn file...")
     path = choose_file_dialog()
@@ -1886,6 +2288,25 @@ def check_file(path: str) -> None:
         print(f"  ⚠ thiếu CCCD: TT{r.get('tt')} {r.get('child_name')}")
 
 
+def repair_import_file(path: str, output: Optional[str] = None) -> str:
+    """Repair a Medinet native-import workbook and print a concise report."""
+    report = workbook_repair.repair_medinet_workbook(path, output)
+    print("\nĐã tạo bản Excel dùng để Nhập file trên Medinet:")
+    print(f"  {report.output}")
+    print(f"  Vùng lọc sai đã sửa : {report.filter_ranges_fixed}")
+    print(f"  Ô sai kiểu đã đổi   : {report.total_cells_converted}")
+    if report.cells_converted:
+        details = ", ".join(
+            f"{field}={count}"
+            for field, count in sorted(report.cells_converted.items())
+        )
+        print(f"  Chi tiết            : {details}")
+    for warning in report.warnings:
+        print(f"  Cảnh báo             : {warning}")
+    print("\nFile gốc được giữ nguyên.")
+    return report.output
+
+
 def main() -> None:
     # No arguments (a double-click) -> the guided flow with the file picker.
     if len(sys.argv) <= 1:
@@ -1900,6 +2321,10 @@ def main() -> None:
 
     if args.check_file:
         check_file(args.check_file)
+        return
+
+    if args.repair_import_file:
+        repair_import_file(args.repair_import_file, args.repair_output)
         return
 
     if args.make_template:

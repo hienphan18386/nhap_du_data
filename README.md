@@ -38,6 +38,11 @@ Các bước — **chỉ cần bấm đúp, không cần gõ lệnh**:
    cạnh file chạy. Mở nó, điền danh sách trẻ (mỗi dòng một bé), lưu lại.
 3. Bấm đúp chạy lại, chọn **[1] Nhập danh sách từ file** → **hộp thoại chọn file**
    mở ra, chọn file **Excel / PDF / JSON** của bạn.
+   Với file mẫu nhập M2 của Medinet, chọn **[3] Sửa file Excel rồi tự động nhập**.
+   Công cụ tạo một bản `_DA_SUA.xlsx`, giữ nguyên file gốc, sau đó tự mở Chrome
+   và tải cả file qua **Nhập → Nhập file**. Medinet nhập các dòng hợp lệ và đưa
+   dòng đã có/sai vào file lỗi. Trên macOS, file được truyền thẳng vào tab Chrome
+   đang đăng nhập nên không mở hộp Finder và không cần quyền Accessibility.
 4. Chọn trình duyệt trong menu — công cụ mở **đúng trình duyệt bạn dùng hằng ngày**:
    - **macOS + Chrome**: dùng luôn Chrome đang có, phiên medinet sẵn đăng nhập.
      Lần đầu Chrome sẽ yêu cầu bật một lần: menu **View → Developer →
@@ -67,6 +72,7 @@ medinet-importer --make-template            # tạo mau_danh_sach.xlsx rồi tho
 medinet-importer --separate-profile         # hồ sơ riêng biệt, đăng nhập 1 lần
 medinet-importer --dry-run --limit 3        # chạy thử 3 hồ sơ, KHÔNG lưu
 medinet-importer --check-file ds.xlsx       # kiểm tra đọc file (không mở trình duyệt)
+medinet-importer --repair-import-file ds.xlsx  # tạo ds_DA_SUA.xlsx để tải lên Medinet
 medinet-importer --selftest                 # kiểm tra máy (không mở trình duyệt)
 ```
 
@@ -75,7 +81,7 @@ medinet-importer --selftest                 # kiểm tra máy (không mở trìn
 
 ### Đối tượng khám: M1 và M2
 
-Khi bấm đúp, menu đầu tiên cho chọn đối tượng khám:
+Sau khi chọn **[1] Nhập danh sách từ file**, menu cho chọn đối tượng khám:
 
 - **[1] Trẻ dưới 6 tuổi (M1)** — luồng mầm non.
 - **[2] TRẺ TỪ 6–17 TUỔI (M2)** — luồng tiểu học/THCS/THPT (form khác của medinet).
@@ -132,6 +138,7 @@ Tải file chạy từ mục **Artifacts** của lần chạy đó.
 
 ```
 app/importer.py         # ứng dụng chính (chọn Chrome/Firefox)
+app/workbook_repair.py  # sửa cấu trúc/kiểu dữ liệu file Excel nhập Medinet
 app/marionette.py       # client Marionette thuần stdlib (lái Firefox thật)
 app/data/children.json  # dữ liệu mẫu, được nhúng vào gói
 tools/parse_mn12_pdf.py # công cụ chuyển PDF → JSON
