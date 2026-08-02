@@ -1683,7 +1683,7 @@ end tell
 })()
 """)
 
-    def upload_excel_file(self, path: str, timeout_s: int = 300) -> Dict:
+    def upload_excel_file(self, path: str, timeout_s: int = 900) -> Dict:
         """Upload one repaired workbook through Medinet's native bulk importer."""
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
@@ -2289,22 +2289,37 @@ def check_file(path: str) -> None:
 
 
 def repair_import_file(path: str, output: Optional[str] = None) -> str:
-    """Repair a Medinet native-import workbook and print a concise report."""
-    report = workbook_repair.repair_medinet_workbook(path, output)
+    """Prepare a Medinet native-import workbook: resolve the school/ward id VLOOKUPs
+    to literal values, writing a new file. The source is left untouched.
+
+    NOTE: we deliberately do NOT run the XML-level repair (repair_medinet_workbook).
+    On the live site that surgery made multi-row uploads hang forever in a loading
+    state (1 row imported, 3+ rows stuck). An openpyxl load+save plus the id fill is
+    all Medinet needs -- verified "Thành công (Số dòng N/N)" for multi-row files.
+    """
+    src = os.path.abspath(os.path.expanduser(path))
+    if output is None:
+        stem, ext = os.path.splitext(src)
+        output = f"{stem}_NHAP{ext or '.xlsx'}"
+
+    # fill_lookup_ids loads the source with openpyxl and saves to `output` with the
+    # school/ward ids resolved -- the openpyxl round-trip is exactly what keeps the
+    # workbook parseable for Medinet's bulk importer.
+    ids = workbook_repair.fill_lookup_ids(src, output)
     print("\nĐã tạo bản Excel dùng để Nhập file trên Medinet:")
-    print(f"  {report.output}")
-    print(f"  Vùng lọc sai đã sửa : {report.filter_ranges_fixed}")
-    print(f"  Ô sai kiểu đã đổi   : {report.total_cells_converted}")
-    if report.cells_converted:
-        details = ", ".join(
-            f"{field}={count}"
-            for field, count in sorted(report.cells_converted.items())
-        )
-        print(f"  Chi tiết            : {details}")
-    for warning in report.warnings:
-        print(f"  Cảnh báo             : {warning}")
+    print(f"  {output}")
+    print(f"  Điền TruongId        : {ids.filled_school} dòng")
+    print(f"  Điền PhuongXa(trường): {ids.filled_ward} dòng")
+    if ids.unresolved_school:
+        uniq = sorted(set(ids.unresolved_school))
+        print(f"  ⚠ Trường KHÔNG khớp danh mục ({len(uniq)}): {uniq[:10]}")
+        print("    -> các dòng này sẽ bị Medinet loại; sửa tên trường cho khớp.")
+    if ids.unresolved_ward:
+        uniq = sorted(set(ids.unresolved_ward))
+        print(f"  ⚠ Phường(trường) KHÔNG khớp ({len(uniq)}): {uniq[:10]}")
+
     print("\nFile gốc được giữ nguyên.")
-    return report.output
+    return output
 
 
 def main() -> None:

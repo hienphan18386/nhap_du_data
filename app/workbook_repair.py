@@ -395,3 +395,110 @@ def repair_medinet_workbook(
         raise
 
     return report
+
+
+@dataclass
+class LookupFillReport:
+    filled_school: int = 0
+    filled_ward: int = 0
+    unresolved_school: List[str] = field(default_factory=list)
+    unresolved_ward: List[str] = field(default_factory=list)
+
+
+# Field codes on the "THÔNG TIN HÀNH CHÍNH" sheet (row 4) whose values Medinet needs
+# as resolved ids. The template ships them as VLOOKUP formulas (TRUONG_ID, ...), but
+# a workbook generated without Excel recalculating leaves the formula CACHE empty, so
+# Medinet reads a blank id and rejects the row with "Vui lòng nhập trường!". We compute
+# the ids ourselves from the workbook's own lookup sheets and write literal values.
+ADMIN_SHEET = "THÔNG TIN HÀNH CHÍNH"
+_SCHOOL_NAME_CODE = "TRUONG_TEN_TRUONG"      # source name -> id in DynamicData!B:C
+_SCHOOL_ID_CODE = "TRUONG_ID"
+_SCHOOL_WARD_NAME_CODE = "TRUONG_PHUONG_XA"  # source name -> id in 'PHƯỜNG XÃ'!C:D
+_SCHOOL_WARD_ID_CODE = "TRUONG_PHUONG_XA_ID"
+
+
+def _build_lookup(pairs) -> Dict[str, object]:
+    table: Dict[str, object] = {}
+    for name, value in pairs:
+        if name is None or value is None:
+            continue
+        key = str(name).strip()
+        if key and key not in table:
+            table[key] = value
+    return table
+
+
+def fill_lookup_ids(path: str, output: Optional[str] = None) -> LookupFillReport:
+    """Resolve the school / school-ward id VLOOKUPs to literal values in place.
+
+    Medinet's native import reads cell values, not formulas; the shipped template's
+    id columns are uncomputed VLOOKUPs, so every row would fail "Vui lòng nhập
+    trường!". This reads DS_TRUONG (DynamicData!B:C) and the WARD table
+    ('PHƯỜNG XÃ'!C:D) and writes the matching ids into the *_ID columns. Names that
+    do not match any catalogue entry are left blank and reported.
+    """
+    import openpyxl  # local import: only this path needs it
+
+    wb = openpyxl.load_workbook(path)
+    if ADMIN_SHEET not in wb.sheetnames:
+        return LookupFillReport()
+
+    school_map = {}
+    if "DynamicData" in wb.sheetnames:
+        dd = wb["DynamicData"]
+        school_map = _build_lookup(
+            (row[0], row[1])
+            for row in dd.iter_rows(min_row=1, max_row=dd.max_row, min_col=2,
+                                    max_col=3, values_only=True)
+        )
+    ward_map = {}
+    if "PHƯỜNG XÃ" in wb.sheetnames:
+        wsheet = wb["PHƯỜNG XÃ"]
+        ward_map = _build_lookup(
+            (wsheet.cell(r, 3).value, wsheet.cell(r, 4).value)
+            for r in range(2, wsheet.max_row + 1)
+        )
+
+    ws = wb[ADMIN_SHEET]
+    # Locate the field-code row (the one carrying HO_TEN) and map code -> column.
+    code_row = None
+    codes: Dict[str, int] = {}
+    for r in range(1, min(ws.max_row, 12) + 1):
+        row_codes = {
+            str(ws.cell(r, c).value).strip(): c
+            for c in range(1, ws.max_column + 1)
+            if ws.cell(r, c).value is not None
+        }
+        if "HO_TEN" in row_codes:
+            code_row, codes = r, row_codes
+            break
+    if code_row is None:
+        return LookupFillReport()
+
+    name_col = codes.get("HO_TEN")
+    school_name_col = codes.get(_SCHOOL_NAME_CODE)
+    school_id_col = codes.get(_SCHOOL_ID_CODE)
+    ward_name_col = codes.get(_SCHOOL_WARD_NAME_CODE)
+    ward_id_col = codes.get(_SCHOOL_WARD_ID_CODE)
+
+    report = LookupFillReport()
+    for r in range(code_row + 1, ws.max_row + 1):
+        if not name_col or ws.cell(r, name_col).value in (None, ""):
+            continue
+        if school_name_col and school_id_col:
+            school = str(ws.cell(r, school_name_col).value or "").strip()
+            if school in school_map:
+                ws.cell(r, school_id_col).value = school_map[school]
+                report.filled_school += 1
+            elif school:
+                report.unresolved_school.append(school)
+        if ward_name_col and ward_id_col:
+            sward = str(ws.cell(r, ward_name_col).value or "").strip()
+            if sward in ward_map:
+                ws.cell(r, ward_id_col).value = ward_map[sward]
+                report.filled_ward += 1
+            elif sward:
+                report.unresolved_ward.append(sward)
+
+    wb.save(output or path)
+    return report
