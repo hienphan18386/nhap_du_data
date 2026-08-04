@@ -4,6 +4,23 @@ This file provides a summary of the data entry automation task, final statistics
 
 ---
 
+## Project Scope — Mandatory For This Session
+* **Current and only project**: `NHAP_DATA_LONG`.
+* **Canonical project root**:
+  `/Users/hienphantrong/Desktop/Project/AI_PROJECT/NHAP_DATA_LONG`.
+* Before reading, editing, testing, building, or starting an app, verify that the
+  working directory and target files belong to this root.
+* Do not reuse implementation context, file paths, running servers, UI work, or
+  assumptions from `WEB_MANGA`, `IMPORT_DATA_LONG`, or any other repository.
+* Do not edit another project unless the user explicitly names that project in a
+  new request. A file mentioned from `Downloads` is input data, not a change of
+  project.
+* Project-specific Claude memory is under
+  `/Users/hienphantrong/.claude/projects/-Users-hienphantrong-Desktop-Project-AI-PROJECT-NHAP-DATA-LONG/`.
+  Do not read or update the memory directory of another project for this work.
+
+---
+
 ## 📌 Context & Goals
 * **Target Website**: [Health Check Report Viewer](https://quanlyskcd.medinet.org.vn/app/main/dynamicreport/report/viewer-utility/KSK_KSKTE_TreEmDuoi24_ThongTinHanhChinh) (requires active authenticated session in the user's Google Chrome).
 * **Objective**: Automatically import children health check administrative records from the parsed OCR list into the database, skipping duplicates.
@@ -125,6 +142,49 @@ medinet form (except final saved-date confirmation, which waits for new data).
   `_initial_activate_done` flag on `AppleScriptImporter`.
 * **Rebuilt packaged app**: `pyinstaller packaging/importer.spec` →
   `dist/medinet-importer` includes both fixes.
+
+### 0d. Menu [3] — Repair Excel And Auto-Import To Medinet (Latest)
+* The double-click menu now includes **[3] Sửa file Excel rồi tự động nhập vào
+  Medinet (M2)**. This is one end-to-end operation: select the source workbook,
+  create a corrected copy, then upload that corrected copy through Medinet's
+  **Nhập → Nhập file** flow. It must not fall back to row-by-row form entry.
+* **File picker fix**: option [3] intentionally reuses `choose_file_dialog()` from
+  option [1]. A separate Excel-only macOS picker made valid LibreOffice-generated
+  `.xlsx` files appear disabled. After selection, option [3] explicitly accepts
+  `.xlsx` and `.xlsm`; other extensions are rejected.
+* **Output and source safety**: `repair_import_file()` keeps the source workbook
+  unchanged and writes a sibling file named `<source>_NHAP.xlsx` (or keeps the
+  original Excel extension). This generated file is the one uploaded to Medinet.
+* **Required workbook preparation**: `workbook_repair.fill_lookup_ids()` opens and
+  saves the workbook with openpyxl, resolves school IDs from `DynamicData!B:C`,
+  resolves school-ward IDs from `'PHƯỜNG XÃ'!C:D`, and writes literal IDs into the
+  administrative sheet. Unmatched school/ward names remain blank and are reported.
+* **Do not use XML-level repair for option [3]**: calling
+  `repair_medinet_workbook()` caused the live Medinet importer to process one row
+  but hang indefinitely for files with 3+ rows. The verified path is only the
+  openpyxl round-trip plus `fill_lookup_ids()`. Multi-row upload was verified with
+  Medinet's result `Thành công (Số dòng N/N)`.
+* **Chrome upload on macOS**: `AppleScriptImporter._attach_bulk_file()` reads the
+  repaired workbook in the app, transfers it to the signed-in Chrome tab in small
+  base64 chunks, creates a browser `File`, assigns it through `DataTransfer`, and
+  dispatches the file input's `change` event. This avoids Finder and Accessibility
+  permission. Chrome still requires **View → Developer → Allow JavaScript from
+  Apple Events**.
+* If the existing Chrome tab cannot receive the file, the app automatically tries
+  `upload_repaired_file_with_separate_chrome()` using a persistent Playwright
+  Chrome/Edge profile. Option [3]'s automatic bulk upload is currently macOS-only;
+  Firefox is not its primary path.
+* The bulk result wait is up to **900 seconds**. A Medinet message mentioning a
+  **file lỗi** means processing completed: valid rows were imported and rows that
+  already existed or failed validation are available in Medinet's error workbook.
+  The app must continue to preserve the rule of never modifying/deleting existing
+  records.
+* CLI repair-only command:
+  `medinet-importer --repair-import-file ds.xlsx`.
+  It creates the `_NHAP` workbook and exits; the double-click option [3] additionally
+  uploads it automatically.
+* Relevant regression tests are `tests/test_workbook_repair.py` and
+  `tests/test_bulk_file_upload.py`.
 
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.
