@@ -326,7 +326,22 @@ class Importer:
                     const el = document.querySelector(sel + ' input.dx-texteditor-input');
                     return el ? el.value.trim() : null;
                 }};
-                return {{hoTen: read('.HoTen'), maDinhDanh: read({js_string(self.cccd_selector)})}};
+                const readId = sel => {{
+                    const el = document.querySelector(sel + ' input[type="hidden"]');
+                    return el ? el.value.trim() : null;
+                }};
+                return {{
+                    hoTen: read('.HoTen'),
+                    maDinhDanh: read({js_string(self.cccd_selector)}),
+                    phuongCuTru: read('.DiaChiHienTai_XaPhuong'),
+                    phuongCuTruId: readId('.DiaChiHienTai_XaPhuong'),
+                    phuongTruong: read('.TreEm_XaPhuong'),
+                    phuongTruongId: readId('.TreEm_XaPhuong'),
+                    truong: read('.TreEm_TruongHocId'),
+                    truongId: readId('.TreEm_TruongHocId'),
+                    diaChiTruong: read('.TreEm_DiaChiTruong'),
+                    lopTruong: read('.TreEm_Lop')
+                }};
             }})()
         """)
         expected_name = r["child_name"].upper().strip()
@@ -336,6 +351,65 @@ class Importer:
         if (actual.get("maDinhDanh") or "") != r["child_cccd"]:
             print(f"  ABORT: form shows CCCD {actual.get('maDinhDanh')!r}, expected {r['child_cccd']!r} -- not saving")
             return False
+        expected_home_ward = (r.get("ward") or "").strip()
+        actual_home_ward = actual.get("phuongCuTru") or ""
+        if (
+            not expected_home_ward
+            or expected_home_ward.lower() not in actual_home_ward.lower()
+            or not (actual.get("phuongCuTruId") or "").strip()
+        ):
+            print(
+                f"  ABORT: form shows home ward {actual_home_ward!r} "
+                f"(id={actual.get('phuongCuTruId')!r}), "
+                f"expected {expected_home_ward!r} -- not saving"
+            )
+            return False
+        if self.age_group == "M2":
+            expected_school_ward = (r.get("school_ward") or "").strip()
+            actual_school_ward = actual.get("phuongTruong") or ""
+            if (
+                not expected_school_ward
+                or expected_school_ward.lower() not in actual_school_ward.lower()
+                or not (actual.get("phuongTruongId") or "").strip()
+            ):
+                print(
+                    f"  ABORT: form shows school ward {actual_school_ward!r} "
+                    f"(id={actual.get('phuongTruongId')!r}), "
+                    f"expected {expected_school_ward!r} -- not saving"
+                )
+                return False
+            expected_school = school_search_core(r.get("school_name", "")).split(" - ", 1)[0].strip()
+            actual_school = actual.get("truong") or ""
+            if (
+                not expected_school
+                or expected_school.lower() not in actual_school.lower()
+                or not (actual.get("truongId") or "").strip()
+            ):
+                print(
+                    f"  ABORT: form shows school {actual_school!r} "
+                    f"(id={actual.get('truongId')!r}), "
+                    f"expected {expected_school!r} -- not saving"
+                )
+                return False
+            actual_school_address = " ".join(str(actual.get("diaChiTruong") or "").split())
+            # Medinet owns the address attached to the selected school catalogue
+            # entry.  It commonly stores only the street here because the ward is
+            # saved in the separate TreEm_XaPhuong field.  Requiring the source's
+            # full address would reject the correct catalogue value after save.
+            if not actual_school_address:
+                print(
+                    "  ABORT: school address is blank after selecting the school "
+                    "-- not saving"
+                )
+                return False
+            expected_class = " ".join(str(r.get("lop") or "").split())
+            actual_class = " ".join(str(actual.get("lopTruong") or "").split())
+            if not expected_class or actual_class != expected_class:
+                print(
+                    f"  ABORT: form shows class {actual_class!r}, "
+                    f"expected {expected_class!r} -- not saving"
+                )
+                return False
         return True
 
     def current_record_id(self) -> Optional[str]:
@@ -457,12 +531,17 @@ class Importer:
         child silently, a wrong no files them twice.
         """
         if self.age_group == "M2":
-            # The M2 report grid does not re-run its search under synthetic events, so a
-            # pre-check here is not trustworthy. medinet itself never files a second
-            # record for an existing CCCD (verified), so we proceed and let the save
-            # outcome classify it: a new phieukhamId = added, a silent non-save with no
-            # validation error = already on file. Safe either way -- no duplicate is
-            # ever created.
+            # The M2 grid can sometimes leave an unfiltered page after synthetic
+            # events, so absence is not always conclusive. A positive match on the
+            # exact CCCD is trustworthy, though, and avoids opening/filling a full
+            # duplicate form. Empty is also a completed filter result; otherwise
+            # proceed and let Medinet's save guard classify the record safely.
+            answer, state = self.search_grid(cccd, min(timeout_s, 8))
+            if answer is True:
+                return True
+            if answer is False:
+                return False
+            print(f"  M2 pre-check inconclusive (grid: {state!r}); proceeding safely")
             return False
 
         for attempt in range(1, attempts + 1):
@@ -529,10 +608,22 @@ class Importer:
 
     def select_searchable_dropdown(self, selector: str, option_text: str, is_school: bool = False) -> bool:
         print(f"  dropdown {selector} -> {option_text}")
+        if not str(option_text or "").strip():
+            print(f"  FAILED: source value is blank for {selector}")
+            return False
         self.run_js(f"""
             (function() {{
-                const btn = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
-                if (btn) btn.click();
+                const root = document.querySelector({js_string(selector)});
+                const btn = root && root.querySelector('.dx-dropdowneditor-button');
+                const input = root && root.querySelector('input.dx-texteditor-input');
+                if (!input) return false;
+                // DevExtreme can toggle twice when a synthetic pointer sequence
+                // is followed by click(). A single click keeps this field's own
+                // popup open and gives the input an aria-controls binding.
+                if (input.getAttribute('aria-expanded') !== 'true') {{
+                    (btn || input).click();
+                }}
+                input.focus();
                 return true;
             }})()
         """)
@@ -543,30 +634,88 @@ class Importer:
             (function() {{
                 const input = document.querySelector({js_string(selector + ' input.dx-texteditor-input')});
                 if (!input) return false;
-                input.value = {js_string(search_text)};
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.focus();
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(input, {js_string(search_text)});
+                input.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: {js_string(search_text)} }}));
+                input.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'u', code: 'KeyU', bubbles: true }}));
                 return true;
             }})()
         """)
 
         needle = search_text.lower()
-        for attempt in range(5):
-            time.sleep(0.6)
+        for attempt in range(10):
+            # Remote ward catalogues can take several seconds to replace the
+            # first virtualized page with the filtered result.
+            time.sleep(0.7)
             res = self.run_js(f"""
                 (function() {{
                     const needle = {js_string(needle)};
-                    const items = Array.from(document.querySelectorAll('.dx-list-item-content'))
-                        .filter(el => el.offsetHeight > 0);
+                    const root = document.querySelector({js_string(selector)});
+                    const input = root && root.querySelector('input.dx-texteditor-input');
+                    const controlsId = input && input.getAttribute('aria-controls');
+                    const controlled = controlsId && document.getElementById(controlsId);
+                    const active = Array.from(document.querySelectorAll('.dx-selectbox-popup-wrapper'))
+                        .filter(el => el.getClientRects().length > 0 && !el.classList.contains('dx-state-invisible'))
+                        .sort((a, b) => Number(getComputedStyle(b).zIndex || 0) - Number(getComputedStyle(a).zIndex || 0))[0];
+                    // Bind the click to this field's own list. DevExtreme keeps
+                    // old overlay lists in the DOM, so a global query can click
+                    // an item belonging to another dropdown.
+                    const scope = controlled || active;
+                    if (!scope) return 'Not found (no active list)';
+                    const items = Array.from(scope.querySelectorAll('.dx-list-item-content'));
                     const matched = items.find(el => {{
                         const text = el.innerText.trim().toLowerCase();
-                        return {"text.includes(needle)" if is_school else "text === needle"};
+                        return {"text.includes(needle)" if is_school else "text === needle || text.includes(needle)"};
                     }});
-                    if (matched) {{ matched.click(); return 'Selected'; }}
+                    if (matched) {{
+                        const item = matched.closest('.dx-list-item') || matched;
+                        item.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
+                        item.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
+                        item.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true, cancelable: true }}));
+                        item.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true }}));
+                        item.click();
+                        return 'Selected';
+                    }}
                     return 'Not found (items: ' + items.length + ')';
                 }})()
             """)
             if res == "Selected":
-                return True
+                time.sleep(0.2)
+                committed = self.run_js(f"""
+                    (function() {{
+                        const root = document.querySelector({js_string(selector)});
+                        const input = root && root.querySelector('input.dx-texteditor-input');
+                        const hidden = root && root.querySelector('input[type="hidden"]');
+                        const controlsId = input && input.getAttribute('aria-controls');
+                        const controlled = controlsId && document.getElementById(controlsId);
+                        const selected = controlled && controlled.querySelector(
+                            '.dx-list-item[aria-selected="true"] .dx-list-item-content, ' +
+                            '.dx-list-item.dx-list-item-selected .dx-list-item-content'
+                        );
+                        return {{
+                            text: input ? input.value.trim().toLowerCase() : '',
+                            id: hidden ? hidden.value.trim() : '',
+                            selectedText: selected ? selected.innerText.trim().toLowerCase() : ''
+                        }};
+                    }})()
+                """) or {}
+                if committed.get("id") and needle in committed.get("text", ""):
+                    return True
+                # Some DevExtreme select boxes keep their committed value only
+                # in the controlled list/model: the display input stays blank
+                # and there is no hidden input.  A selected item inside this
+                # field's own aria-controls list is still a real catalogue
+                # selection, unlike merely typing visible text.
+                if needle in committed.get("selectedText", ""):
+                    return True
+                print(
+                    f"    danh mục chưa ghi nhận ID sau khi bấm: "
+                    f"text={committed.get('text')!r}, id={committed.get('id')!r}, "
+                    f"selected={committed.get('selectedText')!r}"
+                )
         print(f"  FAILED to select {option_text!r} in {selector}")
         self.run_js(f"""
             (function() {{
@@ -577,19 +726,32 @@ class Importer:
         """)
         return False
 
-    def select_school_lookup(self, selector: str, school_name: str, timeout_s: int = 8) -> bool:
+    def select_school_lookup(self, selector: str, school_name: str, timeout_s: int = 15) -> bool:
         """Pick a school from a server-backed lookup (M2 .TreEm_TruongHocId).
 
         Unlike the plain dropdown, the options are fetched from the server as the user
         types, so this types the distinctive part of the name, waits for the result to
         arrive, then clicks the row that contains it.
         """
-        core = school_search_core(school_name)
-        print(f"  trường {selector} -> tìm '{core}'")
+        # The remote lookup is more reliable with only the distinctive school name.
+        # Example: "THCS Tăng Bạt Hổ - Phường Xóm Chiếu" -> "Tăng Bạt Hổ".
+        search_text = school_search_core(school_name).split(" - ", 1)[0].strip()
+        print(f"  trường {selector} -> tìm '{search_text}'")
         self.run_js(f"""
             (function() {{
-                const btn = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
-                if (btn) btn.click();
+                function clickDx(el) {{
+                    if (!el) return;
+                    el.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
+                    el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
+                    if (typeof el.focus === 'function') el.focus();
+                    el.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true, cancelable: true }}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true }}));
+                    el.click();
+                }}
+                const root = document.querySelector({js_string(selector)});
+                const input = root && root.querySelector('input.dx-texteditor-input');
+                const btn = root && root.querySelector('.dx-dropdowneditor-button');
+                clickDx(input || btn);
                 return true;
             }})()
         """)
@@ -599,14 +761,33 @@ class Importer:
                 const input = document.querySelector({js_string(selector + ' input.dx-texteditor-input')});
                 if (!input) return false;
                 input.focus();
-                input.value = {js_string(core)};
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.value = '';
+                for (const char of {js_string(search_text)}) {{
+                    input.dispatchEvent(new KeyboardEvent('keydown', {{ key: char, bubbles: true }}));
+                    input.dispatchEvent(new KeyboardEvent('keypress', {{ key: char, bubbles: true }}));
+                    input.value += char;
+                    input.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: char }}));
+                    input.dispatchEvent(new KeyboardEvent('keyup', {{ key: char, bubbles: true }}));
+                }}
                 return true;
             }})()
         """)
-        needle = core.lower()
-        for _ in range(timeout_s):
+        needle = school_search_core(school_name).split(" - ", 1)[0].strip().lower()
+        for attempt in range(timeout_s):
             time.sleep(0.8)
+            committed = self.run_js(f"""
+                (function() {{
+                    const root = document.querySelector({js_string(selector)});
+                    const input = root && root.querySelector('input.dx-texteditor-input');
+                    const hidden = root && root.querySelector('input[type="hidden"]');
+                    return {{
+                        text: input ? input.value.trim().toLowerCase() : '',
+                        id: hidden ? hidden.value.trim() : ''
+                    }};
+                }})()
+            """) or {}
+            if committed.get("id") and needle in committed.get("text", ""):
+                return True
             res = self.run_js(f"""
                 (function() {{
                     const needle = {js_string(needle)};
@@ -617,12 +798,23 @@ class Importer:
                     const items = Array.from(pop.querySelectorAll('.dx-list-item'))
                         .filter(e => e.offsetHeight > 0);
                     const hit = items.find(e => e.innerText.toLowerCase().includes(needle));
-                    if (hit) {{ hit.click(); return 'ok'; }}
+                    if (hit) {{
+                        hit.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
+                        hit.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
+                        hit.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true, cancelable: true }}));
+                        hit.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true }}));
+                        hit.click();
+                        return 'ok';
+                    }}
                     return 'waiting (' + items.length + ')';
                 }})()
             """)
             if res == "ok":
-                return True
+                # A visible label alone is not enough: Medinet validates the hidden
+                # catalogue id. The next pass confirms that the click committed it.
+                continue
+            if attempt < 3:
+                print(f"    chờ danh mục trường: {res}")
         print(f"  KHÔNG chọn được trường {school_name!r}")
         self.run_js(f"""
             (function() {{
@@ -735,6 +927,13 @@ class Importer:
         self.run_js(f"""
             (function() {{
                 const fields = {json.dumps(fields, ensure_ascii=False)};
+                function setNativeValue(el, value) {{
+                    const proto = el instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                    setter.call(el, value);
+                }}
                 function typeVal(selector, val) {{
                     const el = document.querySelector(selector + ' textarea.dx-texteditor-input') ||
                                document.querySelector(selector + ' input.dx-texteditor-input') ||
@@ -742,16 +941,19 @@ class Importer:
                                document.querySelector(selector + ' input');
                     if (!el) return;
                     el.focus();
-                    el.value = '';
+                    let current = '';
+                    setNativeValue(el, current);
+                    el.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'deleteContentBackward' }}));
                     for (const char of val) {{
                         el.dispatchEvent(new KeyboardEvent('keydown', {{ key: char, bubbles: true }}));
                         el.dispatchEvent(new KeyboardEvent('keypress', {{ key: char, bubbles: true }}));
-                        el.value += char;
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        current += char;
+                        setNativeValue(el, current);
+                        el.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: char }}));
                         el.dispatchEvent(new KeyboardEvent('keyup', {{ key: char, bubbles: true }}));
                     }}
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                    el.blur();
                 }}
                 for (const [selector, val] of Object.entries(fields)) typeVal(selector, val);
                 return true;
@@ -896,15 +1098,67 @@ class Importer:
         self.set_choices_m2("Nam" if r["gender"] == "Nam" else "Nữ")
         time.sleep(1.0)
 
-        # Trường học: phường/xã, tên trường, rồi ghi đè địa chỉ + lớp (chọn trường có
-        # thể tự điền địa chỉ, nên điền text sau cùng).
-        self.select_searchable_dropdown(".TreEm_XaPhuong", r["school_ward"])
-        self.select_school_lookup(".TreEm_TruongHocId", r["school_name"])
-        self.fill_text_fields({
-            ".TreEm_DiaChiTruong": r["school_address"],
-            ".TreEm_Lop": str(r["lop"]),
-        })
-        time.sleep(1.5)
+        # Trường học: phường/xã rồi tên trường. Medinet tự điền địa chỉ từ danh
+        # mục trường; giữ nguyên giá trị đó vì khi lưu hệ thống tách phường sang
+        # TreEm_XaPhuong và chỉ giữ phần đường ở TreEm_DiaChiTruong.
+        school_ward_selected = False
+        for ward_attempt in range(1, 4):
+            school_ward_selected = self.select_searchable_dropdown(
+                ".TreEm_XaPhuong", r.get("school_ward", "")
+            )
+            if school_ward_selected:
+                break
+            if ward_attempt < 3:
+                print(f"  thử lại danh mục Xã phường ({ward_attempt + 1}/3)")
+                time.sleep(1.0)
+        school_selected = False
+        if school_ward_selected:
+            for school_attempt in range(1, 4):
+                school_selected = self.select_school_lookup(
+                    ".TreEm_TruongHocId", r["school_name"]
+                )
+                if school_selected:
+                    break
+                if school_attempt < 3:
+                    print(f"  thử lại danh mục Trường ({school_attempt + 1}/3)")
+                    time.sleep(2.0)
+        else:
+            print("  KHÔNG tìm trường vì Xã phường của trường chưa được chọn")
+        fallback_address = " ".join(str(r.get("school_address") or "").split())
+        expected_class = " ".join(str(r["lop"]).split())
+        # The lookup is asynchronous. Wait for its catalogue address first; only
+        # use the source address as a fallback if Medinet really leaves it blank.
+        # Class is always entered manually.
+        for school_text_attempt in range(1, 5):
+            time.sleep(1.5 if school_text_attempt == 1 else 1.0)
+            school_text_state = self.run_js("""
+                (function() {
+                    const read = sel => {
+                        const el = document.querySelector(sel + ' input.dx-texteditor-input');
+                        return el ? el.value.trim() : '';
+                    };
+                    return {
+                        address: read('.TreEm_DiaChiTruong'),
+                        className: read('.TreEm_Lop')
+                    };
+                })()
+            """) or {}
+            actual_address = " ".join(str(school_text_state.get("address") or "").split())
+            actual_class = " ".join(str(school_text_state.get("className") or "").split())
+            if actual_address and actual_class == expected_class:
+                break
+            fields_to_fill = {}
+            if not actual_address and fallback_address:
+                fields_to_fill[".TreEm_DiaChiTruong"] = fallback_address
+            if actual_class != expected_class:
+                fields_to_fill[".TreEm_Lop"] = str(r["lop"])
+            if fields_to_fill:
+                self.fill_text_fields(fields_to_fill)
+            if school_text_attempt < 4:
+                print(
+                    f"  chờ địa chỉ/lớp trường ổn định "
+                    f"({school_text_attempt + 1}/4)"
+                )
 
     def set_choices_m2(self, gender: str) -> None:
         """Set the M2 radios and the required 'hình thức chi trả' lists.
@@ -983,6 +1237,18 @@ class Importer:
             record_id = self.current_record_id()
             if record_id:
                 print(f"  saved (phieukhamId={record_id})")
+                # The SPA updates the URL before it finishes rebinding the saved form.
+                # Wait for the visible fields to return so date/school verification does
+                # not mistake the short reload window for missing data.
+                for _ in range(12):
+                    ready_cccd = self.run_js(
+                        "(function(){var e=document.querySelector("
+                        "'.DinhDanhCaNhan input.dx-texteditor-input');"
+                        "return e?e.value.trim():null;})()"
+                    )
+                    if ready_cccd == r["child_cccd"]:
+                        break
+                    time.sleep(0.5)
                 # A newly created M2 record is always stamped with today's date -- the
                 # create form forces NgayKham = now and no synthetic event can change it.
                 # The exam date only sticks when set on an EXISTING record, so reopen it
@@ -1037,10 +1303,67 @@ class Importer:
             print(f"    form says: {message}")
         return "failed"
 
+    def repair_current_record(self, r: Dict[str, str]) -> bool:
+        """Repair only the currently open saved M2 record, after verifying its CCCD."""
+        record_id = self.current_record_id()
+        if not record_id or not self.on_expected_form():
+            print("  ERROR: tab hiện tại không phải hồ sơ M2 đã lưu -- không sửa")
+            return False
+
+        actual_cccd = self.run_js(
+            "(function(){var e=document.querySelector('.DinhDanhCaNhan input.dx-texteditor-input');"
+            "return e?e.value.trim():null;})()"
+        )
+        if actual_cccd != r["child_cccd"]:
+            print(
+                f"  ERROR: hồ sơ hiện tại là CCCD {actual_cccd!r}, "
+                f"không phải {r['child_cccd']!r} -- không sửa"
+            )
+            return False
+
+        expected_school = school_search_core(r.get("school_name", "")).split(" - ", 1)[0].strip()
+        actual_school = self.run_js(
+            "(function(){var e=document.querySelector("
+            "'.TreEm_TruongHocId input.dx-texteditor-input');return e?e.value.trim():null;})()"
+        ) or ""
+        if expected_school.lower() not in actual_school.lower():
+            print(f"  sửa trường {actual_school!r} -> tìm '{expected_school}'")
+            if not self.select_school_lookup(".TreEm_TruongHocId", r["school_name"]):
+                print("  ERROR: chưa chọn được đúng trường -- không lưu")
+                return False
+
+        target_exam_date = r.get("exam_date") or self.exam_date
+        if not self.set_datebox(".NgayKham", target_exam_date):
+            print("  ERROR: chưa đặt được ngày khám -- không lưu")
+            return False
+        if not self.form_matches_record(r):
+            return False
+
+        self.click_save()
+        time.sleep(5.0)
+        got_date = self.run_js(
+            "(function(){var e=document.querySelector('.NgayKham input.dx-texteditor-input');"
+            "return e?e.value.trim():null;})()"
+        )
+        if got_date != target_exam_date:
+            print(f"  ERROR: ngày khám sau lưu là {got_date!r}, mong đợi {target_exam_date!r}")
+            return False
+        print(
+            f"  đã sửa hồ sơ {record_id}: trường '{expected_school}', "
+            f"ngày khám {target_exam_date}"
+        )
+        return True
+
     def _exam_date_needs_edit(self, r: Dict[str, str]) -> bool:
         """Create-mode always stamps today, so only reopen-to-edit when the target
         exam date differs from the machine's current date (e.g. an overnight batch)."""
         target_exam_date = r.get("exam_date") or self.exam_date
+        current_exam_date = self.run_js(
+            "(function(){var e=document.querySelector('.NgayKham input.dx-texteditor-input');"
+            "return e?e.value.trim():null;})()"
+        )
+        if current_exam_date:
+            return current_exam_date != target_exam_date
         return target_exam_date != datetime.now().strftime("%d/%m/%Y")
 
     def _grid_exam_date(self, cccd: str) -> Optional[str]:
@@ -1103,7 +1426,11 @@ class Importer:
         row's exam date. Every other field is left exactly as saved."""
         cccd = r["child_cccd"]
         target_exam_date = r.get("exam_date") or self.exam_date
-        if not self.open_edit_from_grid(cccd):
+        # Immediately after create, Medinet keeps the just-saved record open and its
+        # phieukhamId is already present in the URL. Edit that bound form directly;
+        # routing back to the M2 grid loses the row behind its default filters.
+        on_just_saved_record = bool(self.current_record_id()) and self.form_matches_record(r)
+        if not on_just_saved_record and not self.open_edit_from_grid(cccd):
             print("  ! không sửa được ngày khám (giữ ngày mặc định hôm nay)")
             return False
         if not self.set_datebox(".NgayKham", target_exam_date):
@@ -1111,14 +1438,16 @@ class Importer:
             return False
         self.click_save()
         time.sleep(5.0)
-        # Confirm on the grid that the date actually changed.
-        if self.open_list(30):
-            time.sleep(1.0)
-            got = self._grid_exam_date(cccd)
-            if got == target_exam_date:
-                print(f"  ngày khám đã sửa -> {target_exam_date}")
-                return True
-            print(f"  ! ngày khám sau sửa là {got!r}, mong đợi {target_exam_date!r}")
+        # Confirm on the bound form. This avoids the M2 grid's server-side date filter
+        # and still proves that the record retained the requested value after save.
+        got = self.run_js(
+            "(function(){var e=document.querySelector('.NgayKham input.dx-texteditor-input');"
+            "return e?e.value.trim():null;})()"
+        )
+        if got == target_exam_date:
+            print(f"  ngày khám đã sửa -> {target_exam_date}")
+            return True
+        print(f"  ! ngày khám sau sửa là {got!r}, mong đợi {target_exam_date!r}")
         return False
 
 
@@ -1141,6 +1470,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="fill forms but never save")
     parser.add_argument("--limit", type=int, help="only process the first N eligible records")
+    parser.add_argument(
+        "--start-at",
+        type=int,
+        default=1,
+        help="bắt đầu từ hồ sơ hợp lệ thứ N (mặc định: 1)",
+    )
     parser.add_argument(
         "--separate-profile",
         action="store_true",
@@ -1176,6 +1511,16 @@ def parse_args() -> argparse.Namespace:
         "--exam-date",
         metavar="DD/MM/YYYY",
         help="ngày khám cố định cho cả lần chạy (mặc định: ngày lúc bắt đầu chạy)",
+    )
+    parser.add_argument(
+        "--repair-current-record",
+        action="store_true",
+        help="chỉ sửa trường/ngày trên hồ sơ M2 đang mở, sau khi đối chiếu CCCD",
+    )
+    parser.add_argument(
+        "--skip-trial",
+        action="store_true",
+        help="không dừng hỏi sau bản M2 thành công đầu tiên",
     )
     args = parser.parse_args()
     # The Importer compares against "M1"/"M2"; keep CLI input consistent with the
@@ -1252,6 +1597,24 @@ def run_import(importer: "Importer", eligible: List[Dict],
     }
     confirmed = not trial_first  # M1 runs without pausing
 
+    def checkpoint(record: Dict, position: int) -> None:
+        """Persist progress after each fully classified row for safe resume."""
+        with open(RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "results": results,
+                    "checkpoint": {
+                        "position": position,
+                        "total": len(eligible),
+                        "tt": record.get("tt"),
+                        "child_cccd": record.get("child_cccd"),
+                    },
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
     for idx, r in enumerate(eligible, 1):
         label = f"{r['child_name']} ({r['child_cccd']})"
         print(f"\n[{idx}/{len(eligible)}] TT{r['tt']} {label}")
@@ -1262,14 +1625,17 @@ def run_import(importer: "Importer", eligible: List[Dict],
             # child or drops them silently. Leave this one for a human.
             print("  cannot tell if already imported -> skipping, enter by hand")
             results["unverified"].append(label)
+            checkpoint(r, idx)
             continue
         if already:
             print("  already imported -> skip")
             results["skipped_existing"].append(label)
+            checkpoint(r, idx)
             continue
 
         status = importer.enter_child_record(r)
         results[status].append(label)
+        checkpoint(r, idx)
         time.sleep(2.0)
 
         # After the first real import in trial mode, ask the user to confirm
@@ -1430,6 +1796,7 @@ class AppleScriptImporter(Importer):
         super().__init__(page=None, dry_run=dry_run, age_group=age_group, exam_date=exam_date)
         self._prompted_js_setting = False
         self._initial_activate_done = False
+        self._tab_marker = "codex-medinet-manual-import"
 
     @staticmethod
     def _osascript(script: str) -> "subprocess.CompletedProcess":
@@ -1445,36 +1812,71 @@ class AppleScriptImporter(Importer):
     def goto(self, url: str) -> None:
         """Point the medinet tab (or a new tab) at url in the user's own Chrome.
 
-        The very first call uses AppleScript with ``activate`` to ensure Chrome
-        is running and the medinet tab exists.  Every call after that navigates
-        via JavaScript (``location.assign``) executed through ``run_js``, which
-        talks to the *existing* tab without bringing Chrome to the foreground.
-        This lets the user keep working in another app while the batch runs.
+        The first call finds or creates the Medinet tab without activating Chrome.
+        Every later call navigates via JavaScript (``location.assign``). No call
+        brings Chrome to the foreground, so the user can work in another app.
         """
         if self._initial_activate_done:
             # Navigate via JS -- no AppleScript window manipulation, no focus steal.
             self.run_js(f"location.assign({js_string(url)})")
             return
 
-        # First call: open/find the tab, activate Chrome so it is visible once.
+        # First call: reuse the tab previously dedicated to this importer. If this
+        # is the first run, prefer Chrome's active Medinet tab, mark it through
+        # window.name, and keep using that exact tab on every later JS call. This
+        # avoids accidentally controlling an older hidden Medinet tab.
+        marker_js = f"window.name = {js_string(self._tab_marker)}; true"
+        marker_check_js = f"window.name === {js_string(self._tab_marker)}"
         self._osascript(f"""
 tell application "Google Chrome"
-    activate
     if (count of windows) = 0 then make new window
-    set found to false
+    set targetTab to missing value
+
     repeat with w in windows
         repeat with t in tabs of w
             if URL of t contains "{self.SITE}" then
-                set URL of t to {self._as_string(url)}
-                set found to true
-                exit repeat
+                if URL of t contains "{self._tab_marker}" then
+                    set targetTab to t
+                    exit repeat
+                end if
+                try
+                    set isMarked to execute t javascript {self._as_string(marker_check_js)}
+                    if isMarked is true or isMarked is "true" then
+                        set targetTab to t
+                        exit repeat
+                    end if
+                end try
             end if
         end repeat
-        if found then exit repeat
+        if targetTab is not missing value then exit repeat
     end repeat
-    if not found then
-        tell front window to make new tab with properties {{URL:{self._as_string(url)}}}
+
+    if targetTab is missing value then
+        try
+            set activeCandidate to active tab of window 1
+            if URL of activeCandidate contains "{self.SITE}" then set targetTab to activeCandidate
+        end try
     end if
+
+    if targetTab is missing value then
+        repeat with w in windows
+            repeat with t in tabs of w
+                if URL of t contains "{self.SITE}" then
+                    set targetTab to t
+                    exit repeat
+                end if
+            end repeat
+            if targetTab is not missing value then exit repeat
+        end repeat
+    end if
+
+    if targetTab is missing value then
+        tell window 1 to set targetTab to make new tab with properties {{URL:{self._as_string(url)}}}
+    end if
+    try
+        execute targetTab javascript {self._as_string(marker_js)}
+    end try
+    set URL of targetTab to {self._as_string(url)}
 end tell
 """)
         self._initial_activate_done = True
@@ -1486,12 +1888,18 @@ end tell
         real Python values, matching what page.evaluate() gives the shared Importer.
         """
         js = f"JSON.stringify(( {code} ))"
+        marker_check_js = f"window.name === {js_string(self._tab_marker)}"
         script = f"""
 tell application "Google Chrome"
     repeat with w in windows
         repeat with t in tabs of w
             if URL of t contains "{self.SITE}" then
-                return execute t javascript {self._as_string(js)}
+                try
+                    set isMarked to execute t javascript {self._as_string(marker_check_js)}
+                    if isMarked is true or isMarked is "true" then
+                        return execute t javascript {self._as_string(js)}
+                    end if
+                end try
             end if
         end repeat
     end repeat
@@ -1700,7 +2108,7 @@ end tell
 
         self._attach_bulk_file(path)
 
-        print("Đã chọn file đã sửa. Medinet đang xử lý...")
+        print("Đã chọn file Excel gốc. Medinet đang xử lý...")
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             result = self._bulk_import_result()
@@ -1736,8 +2144,8 @@ def run_with_chrome_applescript(args: argparse.Namespace, eligible: List[Dict]) 
     )
 
 
-def upload_repaired_file_to_medinet(path: str) -> bool:
-    """Open the M2 bulk importer in real Chrome and upload the repaired workbook."""
+def upload_excel_file_to_medinet(path: str) -> bool:
+    """Open the M2 bulk importer in real Chrome and upload the selected workbook."""
     if sys.platform != "darwin":
         print("ERROR: Tự chọn file trong Chrome hiện chỉ hỗ trợ macOS.")
         return False
@@ -2169,7 +2577,7 @@ def interactive_main() -> None:
     action = _ask("Bạn muốn làm gì?", {
         "1": "Nhập danh sách từ file (Excel / PDF / JSON)",
         "2": "Tạo file Excel mẫu để điền danh sách",
-        "3": "Sửa file Excel rồi tự động nhập vào Medinet (M2)",
+        "3": "Tự động tải file Excel gốc vào Medinet (M2)",
     }, default="1")
     if action == "2":
         target = os.path.join(BASE_DIR, "mau_danh_sach.xlsx")
@@ -2191,10 +2599,14 @@ def interactive_main() -> None:
         if os.path.splitext(path)[1].lower() not in (".xlsx", ".xlsm"):
             print("File đã chọn không phải Excel .xlsx/.xlsm -- thoát.")
             return
-        repaired_path = repair_import_file(path)
-        print("\nBắt đầu tải bản đã sửa vào Medinet bằng Nhập -> Nhập file.")
+        source_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(source_path):
+            print(f"Không tìm thấy file đã chọn: {source_path}")
+            return
+        print("\nBắt đầu tải chính file gốc vào Medinet bằng Nhập -> Nhập file.")
+        print(f"File: {source_path}")
         print("Các dòng đã có/sai sẽ nằm trong file lỗi; dòng hợp lệ vẫn được nhập.")
-        upload_repaired_file_to_medinet(repaired_path)
+        upload_excel_file_to_medinet(source_path)
         return
 
     # --- Chọn đối tượng khám (M1 / M2) ---
@@ -2254,9 +2666,35 @@ def interactive_main() -> None:
 def run(args: argparse.Namespace) -> None:
     """Load the list and run the import with the chosen browser."""
     eligible, no_ward, no_guardian = load_records(
-        args.limit, args.dry_run, path=args.file,
+        None, args.dry_run, path=args.file,
         age_group=getattr(args, "age_group", "M1"),
     )
+    start_at = max(1, getattr(args, "start_at", 1) or 1)
+    eligible = eligible[start_at - 1:]
+    if args.limit:
+        eligible = eligible[:args.limit]
+    if start_at > 1 or args.limit:
+        print(
+            f"Phạm vi lần này: từ hồ sơ hợp lệ {start_at}, "
+            f"xử lý {len(eligible)} hồ sơ."
+        )
+
+    if getattr(args, "repair_current_record", False):
+        if sys.platform != "darwin" or args.browser != "chrome" or args.separate_profile:
+            raise SystemExit("ERROR: --repair-current-record cần Chrome đang mở trên macOS.")
+        if not eligible:
+            raise SystemExit("ERROR: file không có hồ sơ hợp lệ để đối chiếu.")
+        importer = AppleScriptImporter(
+            dry_run=args.dry_run,
+            age_group=getattr(args, "age_group", "M1"),
+            exam_date=getattr(args, "exam_date", None),
+        )
+        if not importer.wait_for_js_permission():
+            raise SystemExit("ERROR: Chrome không cho phép JavaScript từ Apple Events.")
+        ok = importer.repair_current_record(eligible[0])
+        if not ok:
+            raise SystemExit("ERROR: chưa sửa được hồ sơ hiện tại.")
+        return
 
     if args.browser == "firefox":
         results = run_with_firefox(args, eligible)

@@ -75,7 +75,7 @@ No existing children records were modified or deleted.
 The importer now supports a second age group alongside M1 (Trẻ dưới 6 tuổi):
 **M2 (TRẺ TỪ 6–17 TUỔI)**, chosen via the double-click menu or `--age-group m2`.
 Everything below is implemented in `app/importer.py` and verified against the live
-medinet form (except final saved-date confirmation, which waits for new data).
+Medinet form, including successful M2 saves with the requested examination date.
 
 * **M2 form fully reverse-engineered and wired up**. Selectors differ entirely from
   M1: CCCD trẻ = `.DinhDanhCaNhan` (not `.MaDinhDanh`); guardian = `.TreEm_NguoiGiamHo`
@@ -89,9 +89,9 @@ medinet form (except final saved-date confirmation, which waits for new data).
   "Vui lòng ... hình thức chi trả"): `.HinhThucChiTraKhamSK` = "Ngân sách thành phố
   hỗ trợ" and `.HinhThucChiTraKhamSK_ChiTiet` = "Khám theo hợp đồng". Handled in
   `set_choices_m2`.
-* **School is a server-backed lookup** (`select_school_lookup`): option text is
-  e.g. "TH Đinh Bộ Lĩnh - Phường Xóm Chiếu"; type the distinctive core, wait for
-  the async result, then click it.
+* **School is a server-backed lookup** (`select_school_lookup`): search with only
+  the distinctive core (for example, `Tăng Bạt Hổ`, not the full school + ward
+  label), wait for the async result, then select the exact option.
 * **Fixed examination date (Ngày khám)**: `.NgayKham` is a DevExtreme DateBox where
   **typing only changes the display, not the saved value** — an overnight run would
   otherwise file the next day's date. Fixed with `set_datebox()`, which drives the
@@ -99,8 +99,8 @@ medinet form (except final saved-date confirmation, which waits for new data).
   `.dx-calendar-navigator-previous-view/next-view`) so the real model value commits.
   The exam date is captured once at run start (`Importer.exam_date`, or
   `--exam-date DD/MM/YYYY`) and stays constant across midnight. Calendar mechanism
-  verified without saving (chose 18/07 same month, 05/06 prev month, held after blur);
-  the saved-date in DB will be confirmed on the first M2 trial when new data arrives.
+  verified without saving (chose 18/07 same month, 05/06 prev month, held after blur)
+  and later verified on saved Tăng Bạt Hổ records using `30/07/2026`.
 * **Skip placeholder CCCD**: `is_importable_cccd()` drops records whose CCCD is blank
   or a single repeated digit (e.g. `999999999999`, `000000000000`).
 * **Guardian CCCD is REQUIRED on M2** but 158/533 source rows have none →
@@ -112,8 +112,9 @@ medinet form (except final saved-date confirmation, which waits for new data).
   count stays stuck). Instead we rely on medinet itself refusing a second record for
   an existing CCCD — verified no duplicate is created. A silent non-save with empty
   `validation_messages()` is classified as "duplicate/already on file".
-* **M2 always runs a "bản thử" first**: fills 1 student, shows the result, asks
-  "Tiếp tục nhập hết? (y/n)". This is a required checkpoint before bulk import.
+* **M2 runs a "bản thử" first by default**: fills 1 student, shows the result, asks
+  "Tiếp tục nhập hết? (y/n)". Controlled unattended runs may use `--skip-trial`
+  after a live trial has already succeeded.
 * **Batch is slow**: ~60–75s per M2 record over AppleScript (~9–11h for all 533).
   Run overnight or in chunks with `--limit`. Packaged app rebuilt with all of the
   above. Deeper detail lives in the `m2-form-quirks` memory file.
@@ -132,40 +133,35 @@ medinet form (except final saved-date confirmation, which waits for new data).
   districts.
 * **Chrome focus-stealing fixed** (`app/importer.py`,
   `AppleScriptImporter.goto()`): During batch import, every call to
-  `open_new_form()` → `open_list()` → `goto(list_url)` previously used
-  AppleScript `set URL of t` which brought Chrome to the foreground, disrupting
-  the user working in another app. Fix: after the very first `goto()` (which
-  still uses AppleScript `activate` to launch Chrome), all subsequent navigations
-  use **JavaScript `location.assign(url)`** via `run_js()`. Since `run_js()`
-  only executes JS in the existing tab without any window-level AppleScript
-  commands, Chrome stays in the background. Controlled by the
-  `_initial_activate_done` flag on `AppleScriptImporter`.
+  `open_new_form()` → `open_list()` → `goto(list_url)` previously brought
+  Chrome to the foreground. The first navigation now finds or creates the Medinet
+  tab without `activate`; subsequent navigations use JavaScript
+  `location.assign(url)` via `run_js()`. School selection also no longer calls
+  `System Events` or sends macOS keystrokes. The user can keep using the mouse and
+  keyboard in another application while Medinet is controlled in the background.
 * **Rebuilt packaged app**: `pyinstaller packaging/importer.spec` →
   `dist/medinet-importer` includes both fixes.
 
-### 0d. Menu [3] — Repair Excel And Auto-Import To Medinet (Latest)
-* The double-click menu now includes **[3] Sửa file Excel rồi tự động nhập vào
-  Medinet (M2)**. This is one end-to-end operation: select the source workbook,
-  create a corrected copy, then upload that corrected copy through Medinet's
-  **Nhập → Nhập file** flow. It must not fall back to row-by-row form entry.
+### 0d. Menu [3] — Upload Original Excel To Medinet (Latest)
+* The double-click menu now includes **[3] Tự động tải file Excel gốc vào Medinet
+  (M2)**. It uploads the exact workbook selected by the user through Medinet's
+  **Nhập → Nhập file** flow. It does not create, require, or search for a
+  `*_NHAP.xlsx` copy and does not fall back to row-by-row form entry.
 * **File picker fix**: option [3] intentionally reuses `choose_file_dialog()` from
   option [1]. A separate Excel-only macOS picker made valid LibreOffice-generated
   `.xlsx` files appear disabled. After selection, option [3] explicitly accepts
   `.xlsx` and `.xlsm`; other extensions are rejected.
-* **Output and source safety**: `repair_import_file()` keeps the source workbook
-  unchanged and writes a sibling file named `<source>_NHAP.xlsx` (or keeps the
-  original Excel extension). This generated file is the one uploaded to Medinet.
-* **Required workbook preparation**: `workbook_repair.fill_lookup_ids()` opens and
-  saves the workbook with openpyxl, resolves school IDs from `DynamicData!B:C`,
-  resolves school-ward IDs from `'PHƯỜNG XÃ'!C:D`, and writes literal IDs into the
-  administrative sheet. Unmatched school/ward names remain blank and are reported.
+* **Original-file behavior**: option [3] normalizes the selected path, verifies the
+  file still exists, prints the exact path, and sends that same file to Medinet.
+  The separate `--repair-import-file` CLI remains available when a corrected copy
+  is explicitly requested, but it is not part of menu option [3].
 * **Do not use XML-level repair for option [3]**: calling
   `repair_medinet_workbook()` caused the live Medinet importer to process one row
   but hang indefinitely for files with 3+ rows. The verified path is only the
   openpyxl round-trip plus `fill_lookup_ids()`. Multi-row upload was verified with
   Medinet's result `Thành công (Số dòng N/N)`.
 * **Chrome upload on macOS**: `AppleScriptImporter._attach_bulk_file()` reads the
-  repaired workbook in the app, transfers it to the signed-in Chrome tab in small
+  selected workbook in the app, transfers it to the signed-in Chrome tab in small
   base64 chunks, creates a browser `File`, assigns it through `DataTransfer`, and
   dispatches the file input's `change` event. This avoids Finder and Accessibility
   permission. Chrome still requires **View → Developer → Allow JavaScript from
@@ -179,12 +175,55 @@ medinet form (except final saved-date confirmation, which waits for new data).
   already existed or failed validation are available in Medinet's error workbook.
   The app must continue to preserve the rule of never modifying/deleting existing
   records.
-* CLI repair-only command:
+* Optional CLI repair-only command:
   `medinet-importer --repair-import-file ds.xlsx`.
-  It creates the `_NHAP` workbook and exits; the double-click option [3] additionally
-  uploads it automatically.
+  It creates the `_NHAP` workbook and exits; menu option [3] does not call it.
 * Relevant regression tests are `tests/test_workbook_repair.py` and
   `tests/test_bulk_file_upload.py`.
+
+### 0e. THCS Tăng Bạt Hổ (30/07/2026) — Mapping + Safe Background Entry
+* **Source and mapped workbook**:
+  `data/Tang ban ho kham ngay 30_07_2026_da_bo_sung_phuong_long.xlsx` was mapped
+  into
+  `outputs/019fd1f5-1b32-7411-bca1-3646ea6d2f7b/NHAP_LIEU_HOC_SINH_TANG_BAT_HO_30_07_2026.xlsx`.
+  The mapped file contains **1,023 students** and uses examination date
+  `30/07/2026`, school ward `Phường Xóm Chiếu`, relationship `Mẹ`, payment
+  `Ngân sách thành phố hỗ trợ`, and support type `Khám theo hợp đồng`.
+* **Eligible rows**: **1,019** rows have the required guardian CCCD. Four rows
+  cannot be saved through the M2 form because guardian CCCD is mandatory:
+  TT465 Nguyễn Đình Đình (`079313024588`), TT480 Nguyễn Đức Phúc
+  (`079213029564`), TT606 Nguyễn Hoàng Anh (`079213007407`), and TT628
+  Nguyễn Ngọc Quyên (`079313044008`). Do not invent guardian identifiers.
+* **School lookup rule**: query only `Tăng Bạt Hổ`, then select the exact live
+  option `THCS Tăng Bạt Hổ - Phường Xóm Chiếu` (school ID `23372`, school-ward
+  ID `22`). Do not search using the entire option text.
+* **Pre-save safety guard**: `form_matches_record()` now verifies child name,
+  child CCCD, and the visible school value. If the school does not contain
+  `Tăng Bạt Hổ`, the record is not saved. The lookup may retry up to three times.
+* **Date handling after save**: the importer waits for the SPA to rebind the saved
+  form after `phieukhamId` appears, reads the visible `.NgayKham` value, and
+  edits only the examination date when it differs from the requested value.
+  `correct_exam_date()` uses the currently bound saved form before falling back
+  to the grid.
+* **Resume and repair CLI options**:
+  `--start-at N` resumes from eligible row N, `--limit N` bounds a chunk,
+  `--skip-trial` permits an already-verified unattended chunk, and
+  `--repair-current-record` repairs only the currently open saved record after
+  confirming its CCCD.
+* **Verified live results so far**: the initial record was corrected to the exact
+  Tăng Bạt Hổ school and retained date `30/07/2026`. A later 10-row chunk
+  (eligible rows 4–13) completed with **6 newly saved, 4 already present, 0 failed**.
+  Other trial records were either saved or safely classified as already present.
+  This is progress only, not completion of all 1,023 source rows.
+* **No-focus/background mode**: the old school lookup used `activate Chrome` plus
+  `System Events` select-all/paste, which stole the foreground app, mouse, and
+  keyboard. That path has been removed. `AppleScriptImporter.goto()` no longer
+  activates Chrome, and `AppleScriptImporter.select_school_lookup()` only waits
+  for the signed-in Chrome tab to receive the school selection from the background
+  controller. No active importer process was left running after the foreground
+  issue was reported.
+* **Verification**: `python3 -m unittest discover -s tests` passes **7/7** after
+  the background-navigation and school-selection changes.
 
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.

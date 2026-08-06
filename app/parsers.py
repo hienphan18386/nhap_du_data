@@ -109,8 +109,10 @@ _HEADER_TOKENS = [
     ("phuong xa cua truong", "school_ward"),
     ("phuong/xa truong", "school_ward"),
     ("truong phuong xa", "school_ward"),
-    ("noi hoc/noi lam viec", "school_ward"),
-    ("noi hoc noi lam viec", "school_ward"),
+    ("xa noi hoc/noi lam viec", "school_ward"),
+    ("xa noi hoc noi lam viec", "school_ward"),
+    ("noi hoc/noi lam viec", "school_name"),
+    ("noi hoc noi lam viec", "school_name"),
     ("noi dang theo hoc", "school_name"),
     ("noi dang lam viec", "school_name"),
     ("ten truong", "school_name"),
@@ -212,6 +214,57 @@ def _finish_record(raw: Dict, tt_fallback: int) -> Dict:
     return rec
 
 
+def _excel_header_candidates(row) -> Dict[str, List[int]]:
+    """Return every plausible column for each importer field.
+
+    Some school lists contain two differently named "Nơi ... học" columns. The
+    first can be blank while the later one carries the school name, so keeping only
+    the first header silently loses the value for every student.
+    """
+    found: Dict[str, List[int]] = {}
+    for col, cell in enumerate(row):
+        folded = _fold(cell).replace("_", " ")
+        if not folded:
+            continue
+        for token, key in _HEADER_TOKENS:
+            if token in folded:
+                found.setdefault(key, []).append(col)
+                break
+    return found
+
+
+def _excel_row_values(row, mapping: Dict[str, List[int]]) -> Dict:
+    """Read the first non-blank value from every candidate header column."""
+    raw = {}
+    for key, columns in mapping.items():
+        raw[key] = next(
+            (
+                row[col]
+                for col in columns
+                if col < len(row)
+                and row[col] is not None
+                and str(row[col]).strip()
+            ),
+            None,
+        )
+    return raw
+
+
+def _fill_unique_school_name(records: List[Dict]) -> None:
+    """Fill isolated blanks when the workbook contains exactly one school."""
+    names = {
+        (record.get("school_name") or "").strip()
+        for record in records
+        if (record.get("school_name") or "").strip()
+    }
+    if len(names) != 1:
+        return
+    school_name = next(iter(names))
+    for record in records:
+        if not (record.get("school_name") or "").strip():
+            record["school_name"] = school_name
+
+
 def parse_excel(path: str) -> List[Dict]:
     from openpyxl import load_workbook
 
@@ -224,15 +277,7 @@ def parse_excel(path: str) -> List[Dict]:
     # row 2 and a more complete machine header (HO_TEN, NGAY_SINH...) on row 4.
     header_idx, mapping = None, {}
     for idx, row in enumerate(rows[:10]):
-        found = {}
-        for col, cell in enumerate(row):
-            folded = _fold(cell).replace("_", " ")
-            if not folded:
-                continue
-            for token, key in _HEADER_TOKENS:
-                if token in folded and key not in found:
-                    found[key] = col
-                    break
+        found = _excel_header_candidates(row)
         if len(found) > len(mapping):
             header_idx, mapping = idx, found
     if header_idx is None or len(mapping) < 4:
@@ -243,7 +288,7 @@ def parse_excel(path: str) -> List[Dict]:
 
     records = []
     for row in rows[header_idx + 1:]:
-        raw = {key: row[col] if col < len(row) else None for key, col in mapping.items()}
+        raw = _excel_row_values(row, mapping)
         child_name = str(raw.get("child_name") or "").strip()
         if not child_name or not any(ch.isalpha() for ch in child_name):
             continue  # blank / spacer row
@@ -259,6 +304,7 @@ def parse_excel(path: str) -> List[Dict]:
             "Không đọc được dòng học sinh nào từ file Excel này.\n"
             "Kiểm tra lại dòng tiêu đề có cột Họ tên/Họ và tên, Giới tính, Ngày sinh."
         )
+    _fill_unique_school_name(records)
     return records
 
 
