@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 WARD_PATTERNS = [
     ("khánh hội", "Phường Khánh Hội"),
     ("xóm chiếu", "Phường Xóm Chiếu"),
+    ("xóm chiểu", "Phường Xóm Chiếu"),  # common typo in source lists
     ("vĩnh hội", "Phường Vĩnh Hội"),
     ("vình hội", "Phường Vĩnh Hội"),  # common typo in source lists
     ("bình đông", "Phường Bình Đông"),
@@ -36,6 +37,10 @@ WARD_PATTERNS = [
     ("phú thuận", "Phường Phú Thuận"),
     ("tân thuận", "Phường Tân Thuận"),
     ("tân hưng", "Phường Tân Hưng"),
+    ("tân mỹ", "Phường Tân Mỹ"),
+    ("chánh hưng", "Phường Chánh Hưng"),
+    ("cát lái", "Phường Cát Lái"),
+    ("hiệp phước", "Xã Hiệp Phước"),
 ]
 
 

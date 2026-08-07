@@ -60,3 +60,43 @@ class TextFieldCommitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class DropdownClickCadenceTests(unittest.TestCase):
+    """A committed catalogue id is the only success; clicks must not be spammed."""
+
+    def _importer(self, state):
+        importer = Importer(age_group="M2")
+        importer.clicks = 0
+        importer._open_dropdown = lambda sel: None
+        importer._close_dropdown = lambda sel: None
+        importer._type_into_dropdown = lambda sel, text: None
+        importer._dropdown_state = lambda sel: state
+
+        def click(sel, needle, is_school):
+            importer.clicks += 1
+            return "Selected"
+
+        importer._click_dropdown_item = click
+        return importer
+
+    @patch("app.importer.time.sleep", return_value=None)
+    def test_stops_as_soon_as_the_catalogue_id_is_committed(self, _sleep):
+        importer = self._importer({"text": "phường xóm chiếu", "id": "22", "selectedText": ""})
+
+        self.assertTrue(
+            importer.select_searchable_dropdown(".DiaChiHienTai_XaPhuong", "Phường Xóm Chiếu")
+        )
+        self.assertEqual(importer.clicks, 1)
+
+    @patch("app.importer.time.sleep", return_value=None)
+    def test_text_without_a_catalogue_id_is_not_accepted(self, _sleep):
+        # The state the pre-save guard rejects: right words, no id behind them.
+        importer = self._importer({"text": "phường xóm chiếu", "id": "", "selectedText": ""})
+
+        self.assertFalse(
+            importer.select_searchable_dropdown(".DiaChiHienTai_XaPhuong", "Phường Xóm Chiếu")
+        )
+        # Three attempts, one click each -- not one click per poll.
+        self.assertEqual(importer.clicks, 3)

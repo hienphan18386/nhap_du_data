@@ -175,6 +175,11 @@ _SCHOOL_TYPE_WORDS = {
 }
 
 
+def nfc(text: str) -> str:
+    """Precomposed form, so Vietnamese text compares equal however it was encoded."""
+    return unicodedata.normalize("NFC", str(text or ""))
+
+
 def school_search_core(school_name: str) -> str:
     """The distinctive part of a school name, for the remote school lookup."""
     words = clean_school_name(school_name).split()
@@ -216,6 +221,11 @@ class Importer:
     def save_button_label(self) -> str:
         """M1's save button reads 'Lưu'; M2's reads 'Lưu thay đổi'."""
         return "Lưu thay đổi" if self.age_group == "M2" else "Lưu"
+
+    @property
+    def new_form_button_label(self) -> str:
+        """The open form's own add-another button: 'Thêm mới phiếu' on M2, 'Thêm mới' on M1."""
+        return "Thêm mới phiếu" if self.age_group == "M2" else "Thêm mới"
 
     @property
     def search_cccd_selector(self) -> str:
@@ -272,6 +282,14 @@ class Importer:
         boots from the root, and until it has, the report URL produces an empty body
         that is indistinguishable from a slow-loading grid.
         """
+        # Coming back from a form, "Quay lại" is an in-app route change and reaches the
+        # grid several seconds sooner than reloading the whole Angular app. Falls
+        # through to the reload below if the grid does not appear.
+        if self.is_form_open():
+            self.click_back()
+            if self.wait_for_grid(8):
+                return True
+
         self.goto(self.list_url)
         if self.wait_for_grid(20):
             return True
@@ -286,12 +304,28 @@ class Importer:
         return self.wait_for_grid(timeout_s)
 
     def wait_for_grid(self, timeout_s: int = 60) -> bool:
-        """Wait for the report to render. It takes ~12s from a cold navigation."""
-        for _ in range(timeout_s):
-            time.sleep(1.0)
-            if self.has_them_moi():
+        """Wait for the report to render. It takes ~12s from a cold navigation.
+
+        Polls far more often than once a second: each check is an osascript round
+        trip costing ~0.25s anyway, so a short extra sleep keeps the request rate
+        sane while cutting up to a second of dead time off every record.
+        """
+        return self.wait_until(self.has_them_moi, timeout_s)
+
+    @staticmethod
+    def wait_until(condition, timeout_s: float, interval_s: float = 0.2) -> bool:
+        """Poll `condition` until it is truthy, checking immediately first.
+
+        The loops this replaces all slept a full second *before* their first check,
+        so every wait paid for time the page had usually already finished using.
+        """
+        deadline = time.time() + timeout_s
+        while True:
+            if condition():
                 return True
-        return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(interval_s)
 
     def has_them_moi(self) -> bool:
         return self.run_js("""
@@ -344,15 +378,17 @@ class Importer:
                 }};
             }})()
         """)
-        expected_name = r["child_name"].upper().strip()
-        if (actual.get("hoTen") or "").upper() != expected_name:
+        # Compared in NFC throughout: Medinet echoes some Vietnamese text back
+        # decomposed, which is visually identical but unequal as a raw string.
+        expected_name = nfc(r["child_name"]).upper().strip()
+        if nfc(actual.get("hoTen") or "").upper() != expected_name:
             print(f"  ABORT: form shows {actual.get('hoTen')!r}, expected {expected_name!r} -- not saving")
             return False
         if (actual.get("maDinhDanh") or "") != r["child_cccd"]:
             print(f"  ABORT: form shows CCCD {actual.get('maDinhDanh')!r}, expected {r['child_cccd']!r} -- not saving")
             return False
-        expected_home_ward = (r.get("ward") or "").strip()
-        actual_home_ward = actual.get("phuongCuTru") or ""
+        expected_home_ward = nfc(r.get("ward") or "").strip()
+        actual_home_ward = nfc(actual.get("phuongCuTru") or "")
         if (
             not expected_home_ward
             or expected_home_ward.lower() not in actual_home_ward.lower()
@@ -365,8 +401,8 @@ class Importer:
             )
             return False
         if self.age_group == "M2":
-            expected_school_ward = (r.get("school_ward") or "").strip()
-            actual_school_ward = actual.get("phuongTruong") or ""
+            expected_school_ward = nfc(r.get("school_ward") or "").strip()
+            actual_school_ward = nfc(actual.get("phuongTruong") or "")
             if (
                 not expected_school_ward
                 or expected_school_ward.lower() not in actual_school_ward.lower()
@@ -378,8 +414,10 @@ class Importer:
                     f"expected {expected_school_ward!r} -- not saving"
                 )
                 return False
-            expected_school = school_search_core(r.get("school_name", "")).split(" - ", 1)[0].strip()
-            actual_school = actual.get("truong") or ""
+            expected_school = nfc(
+                school_search_core(r.get("school_name", "")).split(" - ", 1)[0]
+            ).strip()
+            actual_school = nfc(actual.get("truong") or "")
             if (
                 not expected_school
                 or expected_school.lower() not in actual_school.lower()
@@ -422,12 +460,46 @@ class Importer:
         match = re.search(r"phieukhamId=(\d+)", self.run_js("location.href"))
         return match.group(1) if match else None
 
+    def blank_form_ready(self) -> bool:
+        """True only for an open, unbound, empty form of the expected type.
+
+        This is the add-only guard: a form still carrying a phieukhamId, or still
+        holding the previous child's values, would be saved *over* an existing
+        record. Read in a single round trip because it is polled.
+        """
+        state = self.run_js(f"""
+            (function() {{
+                const read = sel => {{
+                    const el = document.querySelector(sel + ' input.dx-texteditor-input');
+                    return el ? el.value.trim() : '';
+                }};
+                return {{
+                    href: location.href,
+                    open: !!document.querySelector({js_string(self.form_marker)}),
+                    name: read('.HoTen'),
+                    cccd: read({js_string(self.cccd_selector)})
+                }};
+            }})()
+        """) or {}
+        href = state.get("href") or ""
+        return bool(
+            state.get("open")
+            and self.form_url_marker in href
+            and not re.search(r"phieukhamId=(\d+)", href)
+            and not state.get("name")
+            and not state.get("cccd")
+        )
+
     def open_new_form(self, timeout_s: int = 60) -> bool:
         """Go back to the grid and open a blank form.
 
         Always routing through the grid is what keeps this an add-only script: a form
         already bound to a phieukhamId would otherwise be filled in and saved over,
         editing somebody else's record.
+
+        Skipping the grid by clicking the form's own "Thêm mới phiếu" was measured and
+        rejected: the form it leaves behind never passed blank_form_ready(), so every
+        record paid the 12s wait and then went through the grid anyway.
         """
         if not self.open_list(timeout_s):
             print("  ERROR: grid not ready, 'Thêm mới' missing")
@@ -441,18 +513,16 @@ class Importer:
                 return true;
             })()
         """)
-        for _ in range(timeout_s):
-            time.sleep(1.0)
-            if self.is_form_open():
-                if self.current_record_id():
-                    print("  ERROR: opened an existing record, not a blank form")
-                    return False
-                if not self.on_expected_form():
-                    print(f"  ERROR: opened a different form, expected {self.form_url_marker}")
-                    return False
-                return True
-        print("  ERROR: form did not open")
-        return False
+        if not self.wait_until(self.is_form_open, timeout_s, 0.25):
+            print("  ERROR: form did not open")
+            return False
+        if self.current_record_id():
+            print("  ERROR: opened an existing record, not a blank form")
+            return False
+        if not self.on_expected_form():
+            print(f"  ERROR: opened a different form, expected {self.form_url_marker}")
+            return False
+        return True
 
     def click_save(self) -> None:
         self.run_js(f"""
@@ -607,19 +677,85 @@ class Importer:
     # --- form widgets -------------------------------------------------------
 
     def select_searchable_dropdown(self, selector: str, option_text: str, is_school: bool = False) -> bool:
+        """Pick an option from a DevExtreme select box, by its catalogue entry.
+
+        Success means the widget committed a catalogue id -- not merely that the field
+        shows the right words. Text with no id behind it is exactly what the pre-save
+        guard rejects, so it counts here as a failed attempt worth redoing.
+        """
         print(f"  dropdown {selector} -> {option_text}")
         if not str(option_text or "").strip():
             print(f"  FAILED: source value is blank for {selector}")
             return False
+
+        search_text = clean_school_name(option_text) if is_school else option_text
+        # Medinet renders some catalogue labels decomposed ("Mỹ" as y + combining
+        # tilde) while the source list uses the precomposed form. They look identical
+        # and compare unequal, which silently failed every ward spelled that way, so
+        # both sides are matched in NFC -- the page-side text is normalized in the JS.
+        needle = nfc(search_text).lower()
+
+        # One click per attempt, then cheap read-only checks for the id. Re-clicking
+        # the item every 0.2s until a deadline -- what this used to do -- jammed the
+        # widget often enough to abort 1 record in 12: the field ended up showing the
+        # right text with no catalogue id, and further clicking never recovered it.
+        for attempt in range(1, 4):
+            self._open_dropdown(selector)
+            time.sleep(0.5)
+            self._type_into_dropdown(selector, search_text)
+
+            # Wait for the filter to actually run before clicking: an item picked out
+            # of the still-unfiltered list is one DevExtreme then discards.
+            clicked = False
+            click_deadline = time.time() + 6
+            while True:
+                time.sleep(0.55)
+                if self._click_dropdown_item(selector, needle, is_school) == "Selected":
+                    clicked = True
+                    break
+                if time.time() >= click_deadline:
+                    break
+
+            if clicked:
+                commit_deadline = time.time() + 3
+                while True:
+                    time.sleep(0.2)
+                    committed = self._dropdown_state(selector)
+                    if committed.get("id") and needle in committed.get("text", ""):
+                        return True
+                    # Some DevExtreme select boxes keep their committed value only in
+                    # the controlled list/model: the display input stays blank and
+                    # there is no hidden input. A selected item inside this field's
+                    # own aria-controls list is still a real catalogue selection,
+                    # unlike merely typing visible text.
+                    if needle in committed.get("selectedText", ""):
+                        return True
+                    if time.time() >= commit_deadline:
+                        print(
+                            f"    danh mục chưa ghi nhận ID sau khi bấm: "
+                            f"text={committed.get('text')!r}, id={committed.get('id')!r}, "
+                            f"selected={committed.get('selectedText')!r}"
+                        )
+                        break
+
+            self._close_dropdown(selector)
+            if attempt < 3:
+                print(f"    mở lại danh mục {selector} ({attempt + 1}/3)")
+                time.sleep(0.5)
+
+        print(f"  FAILED to select {option_text!r} in {selector}")
+        return False
+
+    def _open_dropdown(self, selector: str) -> None:
         self.run_js(f"""
             (function() {{
                 const root = document.querySelector({js_string(selector)});
                 const btn = root && root.querySelector('.dx-dropdowneditor-button');
                 const input = root && root.querySelector('input.dx-texteditor-input');
                 if (!input) return false;
-                // DevExtreme can toggle twice when a synthetic pointer sequence
-                // is followed by click(). A single click keeps this field's own
-                // popup open and gives the input an aria-controls binding.
+                // DevExtreme can toggle twice when a synthetic pointer sequence is
+                // followed by click(). A single click keeps this field's own popup
+                // open and gives the input an aria-controls binding.
                 if (input.getAttribute('aria-expanded') !== 'true') {{
                     (btn || input).click();
                 }}
@@ -627,9 +763,17 @@ class Importer:
                 return true;
             }})()
         """)
-        time.sleep(0.5)
 
-        search_text = clean_school_name(option_text) if is_school else option_text
+    def _close_dropdown(self, selector: str) -> None:
+        self.run_js(f"""
+            (function() {{
+                const btn = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
+                if (btn) btn.click();
+                return true;
+            }})()
+        """)
+
+    def _type_into_dropdown(self, selector: str, search_text: str) -> None:
         self.run_js(f"""
             (function() {{
                 const input = document.querySelector({js_string(selector + ' input.dx-texteditor-input')});
@@ -645,86 +789,61 @@ class Importer:
             }})()
         """)
 
-        needle = search_text.lower()
-        for attempt in range(10):
-            # Remote ward catalogues can take several seconds to replace the
-            # first virtualized page with the filtered result.
-            time.sleep(0.7)
-            res = self.run_js(f"""
-                (function() {{
-                    const needle = {js_string(needle)};
-                    const root = document.querySelector({js_string(selector)});
-                    const input = root && root.querySelector('input.dx-texteditor-input');
-                    const controlsId = input && input.getAttribute('aria-controls');
-                    const controlled = controlsId && document.getElementById(controlsId);
-                    const active = Array.from(document.querySelectorAll('.dx-selectbox-popup-wrapper'))
-                        .filter(el => el.getClientRects().length > 0 && !el.classList.contains('dx-state-invisible'))
-                        .sort((a, b) => Number(getComputedStyle(b).zIndex || 0) - Number(getComputedStyle(a).zIndex || 0))[0];
-                    // Bind the click to this field's own list. DevExtreme keeps
-                    // old overlay lists in the DOM, so a global query can click
-                    // an item belonging to another dropdown.
-                    const scope = controlled || active;
-                    if (!scope) return 'Not found (no active list)';
-                    const items = Array.from(scope.querySelectorAll('.dx-list-item-content'));
-                    const matched = items.find(el => {{
-                        const text = el.innerText.trim().toLowerCase();
-                        return {"text.includes(needle)" if is_school else "text === needle || text.includes(needle)"};
-                    }});
-                    if (matched) {{
-                        const item = matched.closest('.dx-list-item') || matched;
-                        item.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
-                        item.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
-                        item.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true, cancelable: true }}));
-                        item.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true }}));
-                        item.click();
-                        return 'Selected';
-                    }}
-                    return 'Not found (items: ' + items.length + ')';
-                }})()
-            """)
-            if res == "Selected":
-                time.sleep(0.2)
-                committed = self.run_js(f"""
-                    (function() {{
-                        const root = document.querySelector({js_string(selector)});
-                        const input = root && root.querySelector('input.dx-texteditor-input');
-                        const hidden = root && root.querySelector('input[type="hidden"]');
-                        const controlsId = input && input.getAttribute('aria-controls');
-                        const controlled = controlsId && document.getElementById(controlsId);
-                        const selected = controlled && controlled.querySelector(
-                            '.dx-list-item[aria-selected="true"] .dx-list-item-content, ' +
-                            '.dx-list-item.dx-list-item-selected .dx-list-item-content'
-                        );
-                        return {{
-                            text: input ? input.value.trim().toLowerCase() : '',
-                            id: hidden ? hidden.value.trim() : '',
-                            selectedText: selected ? selected.innerText.trim().toLowerCase() : ''
-                        }};
-                    }})()
-                """) or {}
-                if committed.get("id") and needle in committed.get("text", ""):
-                    return True
-                # Some DevExtreme select boxes keep their committed value only
-                # in the controlled list/model: the display input stays blank
-                # and there is no hidden input.  A selected item inside this
-                # field's own aria-controls list is still a real catalogue
-                # selection, unlike merely typing visible text.
-                if needle in committed.get("selectedText", ""):
-                    return True
-                print(
-                    f"    danh mục chưa ghi nhận ID sau khi bấm: "
-                    f"text={committed.get('text')!r}, id={committed.get('id')!r}, "
-                    f"selected={committed.get('selectedText')!r}"
-                )
-        print(f"  FAILED to select {option_text!r} in {selector}")
-        self.run_js(f"""
+    def _click_dropdown_item(self, selector: str, needle: str, is_school: bool) -> str:
+        """Click the option matching needle in this field's own list. Never another's."""
+        return self.run_js(f"""
             (function() {{
-                const btn = document.querySelector({js_string(selector + ' .dx-dropdowneditor-button')});
-                if (btn) btn.click();
-                return true;
+                const needle = {js_string(needle)};
+                const root = document.querySelector({js_string(selector)});
+                const input = root && root.querySelector('input.dx-texteditor-input');
+                const controlsId = input && input.getAttribute('aria-controls');
+                const controlled = controlsId && document.getElementById(controlsId);
+                const active = Array.from(document.querySelectorAll('.dx-selectbox-popup-wrapper'))
+                    .filter(el => el.getClientRects().length > 0 && !el.classList.contains('dx-state-invisible'))
+                    .sort((a, b) => Number(getComputedStyle(b).zIndex || 0) - Number(getComputedStyle(a).zIndex || 0))[0];
+                // Bind the click to this field's own list. DevExtreme keeps old
+                // overlay lists in the DOM, so a global query can click an item
+                // belonging to another dropdown.
+                const scope = controlled || active;
+                if (!scope) return 'Not found (no active list)';
+                const items = Array.from(scope.querySelectorAll('.dx-list-item-content'));
+                const matched = items.find(el => {{
+                    const text = el.innerText.trim().normalize('NFC').toLowerCase();
+                    return {"text.includes(needle)" if is_school else "text === needle || text.includes(needle)"};
+                }});
+                if (matched) {{
+                    const item = matched.closest('.dx-list-item') || matched;
+                    item.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
+                    item.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
+                    item.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true, cancelable: true }}));
+                    item.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true }}));
+                    item.click();
+                    return 'Selected';
+                }}
+                return 'Not found (items: ' + items.length + ')';
             }})()
         """)
-        return False
+
+    def _dropdown_state(self, selector: str) -> Dict:
+        """What the field currently holds: visible text, catalogue id, selected item."""
+        return self.run_js(f"""
+            (function() {{
+                const root = document.querySelector({js_string(selector)});
+                const input = root && root.querySelector('input.dx-texteditor-input');
+                const hidden = root && root.querySelector('input[type="hidden"]');
+                const controlsId = input && input.getAttribute('aria-controls');
+                const controlled = controlsId && document.getElementById(controlsId);
+                const selected = controlled && controlled.querySelector(
+                    '.dx-list-item[aria-selected="true"] .dx-list-item-content, ' +
+                    '.dx-list-item.dx-list-item-selected .dx-list-item-content'
+                );
+                return {{
+                    text: input ? input.value.trim().normalize('NFC').toLowerCase() : '',
+                    id: hidden ? hidden.value.trim() : '',
+                    selectedText: selected ? selected.innerText.trim().normalize('NFC').toLowerCase() : ''
+                }};
+            }})()
+        """) or {}
 
     def select_school_lookup(self, selector: str, school_name: str, timeout_s: int = 15) -> bool:
         """Pick a school from a server-backed lookup (M2 .TreEm_TruongHocId).
@@ -755,7 +874,7 @@ class Importer:
                 return true;
             }})()
         """)
-        time.sleep(0.8)
+        time.sleep(0.3)
         self.run_js(f"""
             (function() {{
                 const input = document.querySelector({js_string(selector + ' input.dx-texteditor-input')});
@@ -772,16 +891,24 @@ class Importer:
                 return true;
             }})()
         """)
-        needle = school_search_core(school_name).split(" - ", 1)[0].strip().lower()
-        for attempt in range(timeout_s):
-            time.sleep(0.8)
+        needle = nfc(school_search_core(school_name).split(" - ", 1)[0].strip()).lower()
+        # Same shape as the ward dropdown: check as soon as the server can plausibly
+        # have answered, rather than sleeping a fixed 0.8s before every look. The
+        # deadline keeps the old overall patience for a slow lookup.
+        deadline = time.time() + max(timeout_s, 12)
+        first = True
+        waits = 0
+        while True:
+            if not first:
+                time.sleep(0.25)
+            first = False
             committed = self.run_js(f"""
                 (function() {{
                     const root = document.querySelector({js_string(selector)});
                     const input = root && root.querySelector('input.dx-texteditor-input');
                     const hidden = root && root.querySelector('input[type="hidden"]');
                     return {{
-                        text: input ? input.value.trim().toLowerCase() : '',
+                        text: input ? input.value.trim().normalize('NFC').toLowerCase() : '',
                         id: hidden ? hidden.value.trim() : ''
                     }};
                 }})()
@@ -797,7 +924,7 @@ class Importer:
                     if (!pop) return 'no-pop';
                     const items = Array.from(pop.querySelectorAll('.dx-list-item'))
                         .filter(e => e.offsetHeight > 0);
-                    const hit = items.find(e => e.innerText.toLowerCase().includes(needle));
+                    const hit = items.find(e => e.innerText.normalize('NFC').toLowerCase().includes(needle));
                     if (hit) {{
                         hit.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true, cancelable: true }}));
                         hit.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true }}));
@@ -813,8 +940,11 @@ class Importer:
                 # A visible label alone is not enough: Medinet validates the hidden
                 # catalogue id. The next pass confirms that the click committed it.
                 continue
-            if attempt < 3:
+            if waits < 3:
                 print(f"    chờ danh mục trường: {res}")
+            waits += 1
+            if time.time() >= deadline:
+                break
         print(f"  KHÔNG chọn được trường {school_name!r}")
         self.run_js(f"""
             (function() {{
@@ -843,7 +973,7 @@ class Importer:
             if (b) b.click();
             return true;
         }})()""")
-        time.sleep(0.8)
+        time.sleep(0.35)
 
         # A plain el.click() updates the calendar's display but does NOT commit the
         # value DevExtreme actually saves (same reason radios need a pointer sequence).
@@ -896,7 +1026,7 @@ class Importer:
                 }})()
             """)
             if res == "ok":
-                time.sleep(0.4)
+                time.sleep(0.25)
                 # Close the dropdown to force the widget to commit its picked value.
                 self.run_js(f"""(function() {{
                     if (document.querySelector('.dx-calendar')) {{
@@ -905,11 +1035,11 @@ class Importer:
                     }}
                     return true;
                 }})()""")
-                time.sleep(0.3)
+                time.sleep(0.2)
                 return True
             if res in ("no-cal", "no-cells", "stuck"):
                 break
-            time.sleep(0.4)
+            time.sleep(0.25)
 
         print(f"  KHÔNG chọn được ngày {ddmmyyyy} trên lịch -- điền tay (có thể không lưu đúng)")
         self.run_js(f"""(function() {{
@@ -1087,7 +1217,7 @@ class Importer:
         if guardian_cccd:
             text_fields[".TreEm_CCCD_NguoiGiamHo"] = guardian_cccd
         self.fill_text_fields(text_fields)
-        time.sleep(1.0)
+        time.sleep(0.35)
 
         # Đối tượng (nhóm bệnh nhân) + hình thức khám + phường/xã của trẻ + quan hệ giám hộ
         self.select_searchable_dropdown(".DoiTuong_M13", M2_DOITUONG)
@@ -1096,7 +1226,7 @@ class Importer:
         self.select_searchable_dropdown(".TreEm_MQH_NguoiGiamHo", M2_QUANHE_GIAMHO)
 
         self.set_choices_m2("Nam" if r["gender"] == "Nam" else "Nữ")
-        time.sleep(1.0)
+        time.sleep(0.35)
 
         # Trường học: phường/xã rồi tên trường. Medinet tự điền địa chỉ từ danh
         # mục trường; giữ nguyên giá trị đó vì khi lưu hệ thống tách phường sang
@@ -1110,7 +1240,7 @@ class Importer:
                 break
             if ward_attempt < 3:
                 print(f"  thử lại danh mục Xã phường ({ward_attempt + 1}/3)")
-                time.sleep(1.0)
+                time.sleep(0.5)
         school_selected = False
         if school_ward_selected:
             for school_attempt in range(1, 4):
@@ -1121,7 +1251,7 @@ class Importer:
                     break
                 if school_attempt < 3:
                     print(f"  thử lại danh mục Trường ({school_attempt + 1}/3)")
-                    time.sleep(2.0)
+                    time.sleep(1.0)
         else:
             print("  KHÔNG tìm trường vì Xã phường của trường chưa được chọn")
         fallback_address = " ".join(str(r.get("school_address") or "").split())
@@ -1130,7 +1260,7 @@ class Importer:
         # use the source address as a fallback if Medinet really leaves it blank.
         # Class is always entered manually.
         for school_text_attempt in range(1, 5):
-            time.sleep(1.5 if school_text_attempt == 1 else 1.0)
+            time.sleep(0.6 if school_text_attempt == 1 else 0.5)
             school_text_state = self.run_js("""
                 (function() {
                     const read = sel => {
@@ -1197,7 +1327,7 @@ class Importer:
                 return true;
             }})()
         """)
-        time.sleep(0.8)
+        time.sleep(0.4)
         self.run_js(f"""
             (function() {{
                 {js_helpers}
@@ -1232,23 +1362,27 @@ class Importer:
         # popup when it silently refuses a duplicate, so it does not need the long M1
         # wait -- a shorter timeout there just means less idle time per existing child.
         wait_s = 25 if self.age_group == "M2" else 45
-        for attempt in range(wait_s):
-            time.sleep(1.0)
+        deadline = time.time() + wait_s
+        first_save_check = True
+        while True:
+            if not first_save_check:
+                time.sleep(0.4)
+            first_save_check = False
             record_id = self.current_record_id()
             if record_id:
                 print(f"  saved (phieukhamId={record_id})")
                 # The SPA updates the URL before it finishes rebinding the saved form.
                 # Wait for the visible fields to return so date/school verification does
                 # not mistake the short reload window for missing data.
-                for _ in range(12):
-                    ready_cccd = self.run_js(
+                self.wait_until(
+                    lambda: self.run_js(
                         "(function(){var e=document.querySelector("
                         "'.DinhDanhCaNhan input.dx-texteditor-input');"
                         "return e?e.value.trim():null;})()"
-                    )
-                    if ready_cccd == r["child_cccd"]:
-                        break
-                    time.sleep(0.5)
+                    ) == r["child_cccd"],
+                    6.0,
+                    0.25,
+                )
                 # A newly created M2 record is always stamped with today's date -- the
                 # create form forces NgayKham = now and no synthetic event can change it.
                 # The exam date only sticks when set on an EXISTING record, so reopen it
@@ -1285,6 +1419,9 @@ class Importer:
                 print("  duplicate popup -> already in system elsewhere")
                 self.click_back()
                 return "duplicate"
+
+            if time.time() >= deadline:
+                break
 
         # Timed out with no new record. If the form has no complaint, medinet quietly
         # refused it -- which for M2 means this CCCD is already on file (it never makes
@@ -1437,7 +1574,14 @@ class Importer:
             print("  ! đặt ngày khám thất bại khi sửa")
             return False
         self.click_save()
-        time.sleep(5.0)
+        self.wait_until(
+            lambda: self.run_js(
+                "(function(){var e=document.querySelector('.NgayKham input.dx-texteditor-input');"
+                "return e?e.value.trim():null;})()"
+            ) == target_exam_date,
+            6.0,
+            0.3,
+        )
         # Confirm on the bound form. This avoids the M2 grid's server-side date filter
         # and still proves that the record retained the requested value after save.
         got = self.run_js(
@@ -1617,6 +1761,7 @@ def run_import(importer: "Importer", eligible: List[Dict],
 
     for idx, r in enumerate(eligible, 1):
         label = f"{r['child_name']} ({r['child_cccd']})"
+        started = time.time()
         print(f"\n[{idx}/{len(eligible)}] TT{r['tt']} {label}")
 
         already = importer.check_already_imported(r["child_cccd"])
@@ -1636,7 +1781,8 @@ def run_import(importer: "Importer", eligible: List[Dict],
         status = importer.enter_child_record(r)
         results[status].append(label)
         checkpoint(r, idx)
-        time.sleep(2.0)
+        print(f"  ({status} in {time.time() - started:.0f}s)")
+        time.sleep(0.5)
 
         # After the first real import in trial mode, ask the user to confirm
         if not confirmed and status in ("success", "dry-run"):
@@ -1790,6 +1936,10 @@ class AppleScriptImporter(Importer):
     """
 
     SITE = "quanlyskcd.medinet.org.vn"
+    # Sentinels returned by the AppleScript wrappers, kept distinct from any real
+    # JS result so an empty page value is never mistaken for a missing tab.
+    NO_TAB = "__no_tab__"
+    WRONG_TAB = "__wrong_tab__"
 
     def __init__(self, dry_run: bool = False, age_group: str = "M1",
                  exam_date: Optional[str] = None):
@@ -1797,6 +1947,8 @@ class AppleScriptImporter(Importer):
         self._prompted_js_setting = False
         self._initial_activate_done = False
         self._tab_marker = "codex-medinet-manual-import"
+        # (window index, tab index) of the marked medinet tab, once located.
+        self._tab_ref: Optional[tuple] = None
 
     @staticmethod
     def _osascript(script: str) -> "subprocess.CompletedProcess":
@@ -1887,36 +2039,92 @@ end tell
         Everything goes through JSON.stringify so dicts/bools/numbers come back as
         real Python values, matching what page.evaluate() gives the shared Importer.
         """
-        js = f"JSON.stringify(( {code} ))"
-        marker_check_js = f"window.name === {js_string(self._tab_marker)}"
-        script = f"""
-tell application "Google Chrome"
-    repeat with w in windows
-        repeat with t in tabs of w
-            if URL of t contains "{self.SITE}" then
-                try
-                    set isMarked to execute t javascript {self._as_string(marker_check_js)}
-                    if isMarked is true or isMarked is "true" then
-                        return execute t javascript {self._as_string(js)}
-                    end if
-                end try
-            end if
-        end repeat
-    end repeat
-    return "__no_tab__"
-end tell
-"""
-        proc = self._osascript(script)
-        err = (proc.stderr or "").strip()
-        if err and ("javascript" in err.lower() and ("turned off" in err.lower() or "apple events" in err.lower())):
-            raise AppleScriptJSDisabled(err)
-        out = (proc.stdout or "").strip()
-        if out in ("", "__no_tab__", "missing value", "undefined"):
+        # One 'execute javascript' per call, not two: the tab check rides along inside
+        # the same expression. Profiling a record showed ~100 run_js calls costing
+        # ~0.55s each -- the single largest cost of importing a child -- because every
+        # call walked all windows/tabs and ran a separate marker check first.
+        js = (
+            f"(window.name === {js_string(self._tab_marker)})"
+            f" ? JSON.stringify(( {code} )) : {js_string(self.WRONG_TAB)}"
+        )
+
+        out = self._run_js_on_known_tab(js)
+        if out is None:
+            out = self._run_js_by_searching(js)
+        if out in ("", None, self.NO_TAB, self.WRONG_TAB, "missing value", "undefined"):
             return None
         try:
             return json.loads(out)
         except ValueError:
             return out
+
+    def _osascript_js(self, script: str) -> Optional[str]:
+        """Run an osascript that returns a JS result, raising if Chrome blocks JS."""
+        proc = self._osascript(script)
+        err = (proc.stderr or "").strip()
+        if err and ("javascript" in err.lower() and ("turned off" in err.lower() or "apple events" in err.lower())):
+            raise AppleScriptJSDisabled(err)
+        return (proc.stdout or "").strip()
+
+    def _run_js_on_known_tab(self, js: str) -> Optional[str]:
+        """Run js on the tab found last time, addressed directly by index.
+
+        Returns None when there is no remembered tab, when the indices no longer
+        resolve, or when the tab they point at is not the marked one any more (the
+        user may have opened or closed tabs) -- the caller then searches again.
+        """
+        if not self._tab_ref:
+            return None
+        window_index, tab_index = self._tab_ref
+        out = self._osascript_js(f"""
+tell application "Google Chrome"
+    try
+        return execute tab {tab_index} of window {window_index} javascript {self._as_string(js)}
+    on error
+        return "{self.NO_TAB}"
+    end try
+end tell
+""")
+        if not out or out in (self.NO_TAB, self.WRONG_TAB):
+            self._tab_ref = None
+            return None
+        return out
+
+    def _run_js_by_searching(self, js: str) -> Optional[str]:
+        """Find the marked medinet tab, run js there, and remember where it was.
+
+        The result is prefixed with the window and tab index so the next call can go
+        straight to it instead of walking every tab again.
+        """
+        out = self._osascript_js(f"""
+tell application "Google Chrome"
+    set wi to 0
+    repeat with w in windows
+        set wi to wi + 1
+        set ti to 0
+        repeat with t in tabs of w
+            set ti to ti + 1
+            if URL of t contains "{self.SITE}" then
+                try
+                    set res to execute t javascript {self._as_string(js)}
+                    if res is not "{self.WRONG_TAB}" then
+                        return ((wi as text) & ":" & (ti as text) & ":" & res)
+                    end if
+                end try
+            end if
+        end repeat
+    end repeat
+    return "{self.NO_TAB}"
+end tell
+""")
+        if not out or out == self.NO_TAB:
+            return None
+        window_index, tab_index, result = out.split(":", 2)
+        try:
+            self._tab_ref = (int(window_index), int(tab_index))
+        except ValueError:
+            self._tab_ref = None
+        return result
 
     def wait_for_js_permission(self, timeout_s: int = 600) -> bool:
         """Poll until Chrome lets Apple Events run JS, guiding the user to enable it."""
