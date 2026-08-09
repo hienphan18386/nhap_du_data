@@ -225,6 +225,233 @@ Medinet form, including successful M2 saves with the requested examination date.
 * **Verification**: `python3 -m unittest discover -s tests` passes **7/7** after
   the background-navigation and school-selection changes.
 
+### 0f. Quy trình chuẩn để nhập một file danh sách trường (M2)
+Rút ra từ đợt TH Nguyễn Thái Bình 04/08/2026 (336 dòng → 335 em vào Medinet). Làm
+đúng thứ tự này; các bước kiểm tra không phải là tuỳ chọn.
+
+**1. Đọc thử file trước khi mở trình duyệt**
+```
+python3 -m app.importer --check-file "data/<file>.xlsx"
+```
+Xem số dòng, số thiếu Phường/Xã, số thiếu CCCD người giám hộ. Nếu có dòng
+`no_ward`, thêm alias vào `WARD_PATTERNS` trong `app/parsers.py` — nhưng **phải mở
+danh mục Phường/Xã trên form Medinet, gõ thử và đọc đúng nhãn thật** rồi mới thêm.
+Không suy đoán nhãn (`Xã Hiệp Phước` chứ không phải `Phường Hiệp Phước`).
+
+**2. Chạy một bản thử thật, rồi mới chạy hàng loạt**
+```
+python3 -m app.importer --file "data/<file>.xlsx" --age-group m2 \
+  --exam-date DD/MM/YYYY --limit 1
+```
+Sau khi lưu, **đọc lại form vừa lưu** để đối chiếu tên, CCCD, ngày khám, trường,
+lớp, phường với file nguồn. Chỉ khi bản thử đúng mới chạy tiếp với `--skip-trial`.
+
+**3. Chạy hàng loạt theo từng đợt, ghi log ra file**
+```
+python3 -u -m app.importer --file "data/<file>.xlsx" --age-group m2 \
+  --exam-date DD/MM/YYYY --start-at N --skip-trial > run.log 2>&1 &
+```
+`--start-at` đếm theo **hồ sơ hợp lệ**, không theo TT. Theo dõi log bằng dòng kết
+quả `(failed in Ns)`, **không** bằng các dòng `ABORT` — nhiều dòng ABORT chỉ là bước
+dò nội bộ rồi tự sửa được.
+
+**4. Dừng và chạy tiếp giữa chừng**
+Dừng bằng `pkill -f "app.importer --file"`. Hồ sơ đang dở chưa lưu nên không hỏng.
+Đọc `import_results.json` → `checkpoint.position`; điểm chạy tiếp =
+`--start-at` của lần chạy đó + `position`. Lưu ý `import_results.json` **bị ghi đè
+mỗi lần chạy**, nên phải ghi lại danh sách failed trước khi chạy đợt mới.
+
+**5. Chạy lại các hồ sơ thất bại**
+Chạy riêng từng em bằng `--start-at <index> --limit 1`. Form được nạp mới nên tới
+giờ lần chạy lại nào cũng thành công. **Nếu bỏ qua bước này thì em đó mất luôn** —
+đợt vừa rồi suýt sót một em vì đợt sau bắt đầu từ vị trí sau chỗ lỗi.
+
+**6. Đối chiếu cuối cùng trước khi báo "xong"**
+Ghép từng dòng `[n/N] TTx tên (cccd)` trong log với dòng `saved (phieukhamId=...)`
+ngay sau nó, rồi so với `load_records()`. Các đợt chạy tay không ghi ra file log nên
+phải ghi lại `phieukhamId` riêng. Em nào Medinet báo đã có sẵn (không tạo phiếu mới,
+không báo lỗi) là bình thường, không phải lỗi.
+
+**7. Việc luôn phải làm tay**
+Dòng nào thiếu CCCD người giám hộ thì form M2 không lưu được — liệt kê cho người
+dùng nhập tay. **Không bao giờ tự bịa số định danh.**
+
+**Nguyên tắc bất biến khi sửa code trong luồng này**
+* Mỗi hồ sơ phải đi qua grid rồi mới mở form trắng — đó là thứ giữ cho script chỉ
+  thêm mới, không sửa đè hồ sơ cũ.
+* Với dropdown danh mục, **chỉ `id` danh mục mới là bằng chứng đã chọn**, không phải
+  chữ hiển thị. Mỗi lượt chỉ bấm một lần rồi chờ xác nhận; bấm lại dồn dập làm
+  DevExtreme kẹt.
+* So sánh mọi chữ tiếng Việt lấy từ trang ở dạng **NFC** cả hai phía (`nfc()` bên
+  Python, `.normalize('NFC')` trong JS) — Medinet trả về một số nhãn ở dạng tách dấu.
+* Ngày khám: giữ **cả hai** đường — `set_datebox` lúc tạo và `correct_exam_date()`
+  sau khi lưu. Bỏ đường nào cũng có hồ sơ sai ngày.
+* Sửa code giữa lúc đang chạy hàng loạt thì phải chạy thử lại vài hồ sơ trước khi
+  chạy tiếp; đo trước khi tối ưu, đừng đoán chỗ chậm.
+* Tốc độ thực tế ~60–68s/hồ sơ. `python3 -m unittest discover -s tests` phải xanh
+  (hiện 26/26).
+
+### 0g. Nhập nội dung KHÁM (không phải hành chính) — `app/clinical.py`
+Luồng thứ hai, tách hẳn khỏi `app/importer.py`. `importer.py` **tạo** hồ sơ hành
+chính; `clinical.py` **chỉ sửa hồ sơ đã có**: tìm theo CCCD trong khoảng ngày khám,
+mở hồ sơ đó rồi điền 4 phần chuyên môn. Không bao giờ tạo/xoá hồ sơ. Em nào không
+tìm thấy thì bỏ qua và ghi vào `clinical_results.json` (`not_found`).
+
+```
+python3 -m app.clinical --file "data/<file>.xlsx" --check-file        # chỉ đọc Excel
+python3 -m app.clinical --file "data/<file>.xlsx" --only-cccd <cccd>  # chạy 1 em
+python3 -m app.clinical --file "data/<file>.xlsx" --from 01/07/2026 --to 08/08/2026
+```
+
+**URL từng phần** (`<nav>` = `/nav_group/kskdk_thongtinkhamduoi18/app/main`):
+| Phần | Đường dẫn | Nút lưu |
+|---|---|---|
+| Thông tin hành chính | `<nav>/dynamicform/viewer/KSKD18_TTHC/<pid>` | Lưu thay đổi |
+| Tiền sử bản thân (gồm **Khám thể lực**) | `<nav>/dynamicform/viewer/KSKD18_TTHC_TienSu/<pid>` | Lưu thay đổi |
+| Đánh giá tâm thần | `<nav>/dynamicviewer/tabpanel/KSKD18_TAB_DANHGIATAMTHAN/<1\|2>/<pid>` | **Lưu** |
+| Khám lâm sàng | `<nav>/dynamicform/viewer/KSKD18_ThongTinKham/<pid>` | Lưu thay đổi |
+| Kết luận | `<nav>/dynamicform/viewer/KSKD18_KetLuanKham/<pid>` | Lưu thay đổi |
+
+Query string bắt buộc: `?cdId=<cdId>&phieukhamId=<pid>&MauKham=mauphieukskd18`.
+Lấy `pid`/`cdId` bằng cách bấm bút sửa trên lưới M2 rồi đọc URL.
+
+**Những cái bẫy đã mất công tìm ra — đừng phá:**
+* **Lưới M2 lọc được theo khoảng ngày khám.** `input[id$="_KSKDK_NgayKham"]` là
+  textbox nhận chuỗi `"01/07/2026 - 08/08/2026"`; gõ từng ký tự rồi bấm `Xem`.
+* **Bẫy nặng nhất: lưới giữ nguyên kết quả của lần tìm trước.** Bấm `Xem` khi lưới
+  còn đang tải thì DevExtreme nuốt cú click (nút đang `dx-state-disabled`), và báo
+  cáo này khôi phục kết quả cũ khi nạp lại trang — nên màn hình hiển thị **hồ sơ của
+  em trước đó**. Lần chạy đầu vì thế báo sai "không tìm thấy" cho 6 em, trong đó 3 em
+  thật sự có hồ sơ. Bắt buộc: chờ lưới rảnh → bấm `Xem` → **chờ nội dung lưới thật sự
+  đổi** rồi mới đọc kết quả (`run_search()`), và `location.reload()` mỗi lần tìm vì
+  `location.assign` sang đúng URL đang mở là lệnh rỗng.
+* **Không được đánh đồng "hết giờ chờ" với "không có hồ sơ".** `find_record()` trả về
+  ba trạng thái: `match` / `empty` / `unknown`. Chỉ `empty` (Medinet tự báo
+  "Không có dữ liệu" hoặc "Có 0 kết quả") mới được ghi là không tìm thấy; `unknown`
+  phải vào nhóm `search_failed` để chạy lại, nếu không sẽ bỏ sót em có hồ sơ.
+  Tìm thấy dứt khoát mất ~9s; chạm mốc 40s gần như luôn là lỗi, không phải vắng mặt.
+* **Số thập phân dùng DẤU PHẨY.** Gõ `121.5` vào ô chiều cao ra **1.215 cm**. Xem
+  `ksk_workbook.number()`. Thị lực `1/10` chỉ nhập tử số (`1`) vào number box.
+* **Lưu xong Medinet KHÔNG báo gì cả** — không toast, không đổi URL. Tệ hơn: các
+  node `"Vui lòng nhập ..."` từ lúc trang mới tải vẫn nằm trong DOM, đọc vào là
+  tưởng lỗi. Hook `fetch`/XHR cũng không bắt được request. **Bằng chứng duy nhất
+  là nạp lại trang và đọc lại giá trị** — đó là việc của các hàm `verify_*`.
+* **Bảng tiêm chủng (38 liều) re-bind sau mỗi lần click.** Click cả 38 trong một
+  lượt JS làm hai grid rỗng và không lưu gì. Phải click từng dòng, cách nhau
+  `VACCINE_TICK_MS` (120ms), do một bộ đếm `setTimeout` chạy trong trang — không
+  phải mỗi dòng một lượt AppleScript (chậm gấp bốn).
+* **Bảng câu hỏi tâm thần nạp dòng dần dần.** Điền ngay sau khi form hiện ra thì
+  mất mấy câu đầu. Phải chờ đủ số dòng (`question_rows()`).
+* **Ba kiểu widget chọn một, trông giống hệt nhau:** dxRadioGroup (`.TS_BanThan_SanKhoa`)
+  có nhãn trong `.dx-item-content`; dxList có trang trí radio (`.DeNghi`) thì
+  **phải click vào `.dx-list-select-radiobutton`**, click vào `.dx-list-item` không
+  ăn; dxList trơn (bảng câu hỏi) thì click thẳng item. `pick_radio()` xử lý cả ba.
+* **"Đề nghị (ghi rõ)" là HtmlEditor (Quill).** `<textarea>` chỉ là submit element,
+  ghi vào đó vô nghĩa. Phải `execCommand('insertText')` trên `.ql-editor` rồi chờ
+  Quill đẩy sang submit element.
+* **Sơ đồ răng không thể hiện tình trạng đã lưu** — mọi răng đều là `t<N>.png` theo
+  vị trí. Muốn biết răng đã ghi "Sâu" chưa thì phải mở popup và đọc `.TinhTrangId`.
+* **"Thần kinh" trong Khám lâm sàng dùng class `NoiTiet_*`** (lỗi đặt tên của
+  Medinet), nhưng phân loại lại là `ThanKinh_PhanLoai`.
+* **Widget ngoài vùng nhìn thấy không nhận click** — DevExtreme đọc toạ độ con trỏ.
+  `__mx.click()` tự `scrollIntoView` trước.
+* **Kết luận phải làm CUỐI CÙNG.** Mục *2. Bệnh, tật cần lưu ý* là ô chỉ đọc, do
+  Medinet tự tính từ các chẩn đoán **đã lưu**. Quy tắc: mục 2 = "Không có" →
+  chọn *Bình thường, hẹn khám định kỳ lần sau*; khác thế → chọn *Có yếu tố nguy cơ,
+  cần theo dõi thêm* và điền cột `Đề nghị` (BM) của Excel vào ô *Đề nghị (ghi rõ)*.
+* **Ngày đánh giá tâm thần = ngày khám của hồ sơ**, không phải hôm nay. Đọc từ cột
+  NGÀY KHÁM của lưới, đặt qua `set_datebox` (gõ tay chỉ đổi chữ hiển thị).
+
+**Em "không đi học" — vì sao tìm không ra (đã điều tra 09/08/2026):**
+Hồ sơ dạng `Mẫu từ 6 đến 18 tuổi không đi học (M12)` có thể **không có Ngày khám**.
+Danh sách M12 lọc **bắt buộc** theo ngày khám — để trống bộ lọc thì truy vấn trả về
+**0 kết quả cho mọi thứ**, nên hồ sơ không có ngày khám thì **không khoảng ngày nào
+chứa được**. Đã thử và đều không ra: mọi khoảng ngày (kể cả 01/01/2020–31/12/2030),
+tìm theo họ tên, `KSKDK_DanhSach_KSK_TheoDiaBan_VIEW`, `KSK_KSKTE_TreEm_..._KTSK`
+(M10), `KSKDK_GhiNhanThongTinDaKhamSucKhoe_Report`.
+**Cách giải — gọi thẳng API, bỏ qua ràng buộc của giao diện.** Ràng buộc "phải có
+ngày khám" **chỉ nằm ở giao diện** (`required=true` trên định nghĩa bộ lọc); stored
+procedure sau lưng nó không đòi. Backend nhận **cookie phiên** của tab đang đăng
+nhập, nên hỏi thẳng báo cáo M12 với mỗi CCCD, **không truyền ngày**, là ra hồ sơ kèm
+`phieukhamId` và `cdId`. Đã cài sẵn trong `ClinicalFiller.api_lookup()`, tự động chạy
+khi lưới báo `empty` — không phải làm gì thêm.
+
+Ba mảnh ghép cần nhớ:
+* Backend: `https://be-qlskcd.medinet.org.vn/api/services/app/...`, gọi bằng
+  `fetch(..., {credentials:'include'})` từ tab đã đăng nhập. **Không cần token** —
+  đừng mất công giải `localStorage['1_keys'].enc_tk` (đã mã hoá, ngõ cụt).
+* Body của `PostDataWithDataOutput` là **mảng `FParameter`**, và trường tên là
+  **`varible`** (backend viết sai chính tả), không phải `name`/`code`/`key`:
+  `[{"varible":"KSKDK_DinhDanhCaNhan","value":"<cccd>"}]`. Tra được nhờ
+  `https://be-qlskcd.medinet.org.vn/swagger/v1/swagger.json` → `definitions.FParameter`.
+  **Swagger mở, dùng nó thay vì đoán.**
+* `reportId` lấy qua `DRReport/GetIdByCode?code=KSKDK_DanhSach_KSK_M12` (hiện là
+  1002123), `SessionSiteId` qua `User/GetSessionSiteByViewCode` (hiện 130).
+  Response có đủ `phieukhamId`, `cdId`, `NgayKham`, `HoTen`, `MaPhieu`.
+
+`--exam-date DD/MM/YYYY` ghi Ngày khám khi ô đang trống → sau đó em đó **hiện ra
+trong danh sách M12 và tìm/sửa bình thường**. Ngày đã có sẵn thì giữ nguyên, trừ khi
+thêm `--force-exam-date`. `--record-url` (dán URL hồ sơ) vẫn còn để dùng tay; nó luôn
+đối chiếu CCCD trên form trước khi nhập, lệch là dừng.
+
+**Không dùng "Thêm mới" để dò ID** — luồng đó có thể tạo hồ sơ trùng, phá vỡ nguyên
+tắc chỉ thêm-không-sửa của dự án.
+
+**JS qua AppleScript chạy ở "isolated world"** — chung DOM nhưng khác `window` với
+app. Vì vậy **không hook được `fetch`/`XHR` của Angular** (đã thử cả vá prototype lẫn
+thay constructor, đều không bắt được — đừng thử lại), và `window.DevExpress`,
+`jQuery`, `ng` đều `undefined` khi nhìn từ đó. Muốn chạy trong page world thì chèn
+`<script>` rồi trả kết quả qua một node DOM ẩn. Muốn biết app gọi API nào thì đọc
+`performance.getEntriesByType('resource')` — cái này thấy hết.
+
+**Mã ICD trong Excel có thể là mã nhóm, Medinet chỉ có mã lá.** Ví dụ `F90`: danh mục
+chỉ có F90.0 / F90.1 / F90.8 / F90.9. Chọn nhánh nào là **quyết định chuyên môn** —
+`fill_diagnosis()` liệt kê các lựa chọn ra log cho người dùng chọn tay, **không tự
+đoán**.
+
+**Giả định đang áp dụng, nếu sai thì sửa ở đây:** cột `Tiêm chủng` chỉ có một giá
+trị chung ("Đã tiêm") nên được áp cho **cả 38 liều**; cột `Tiền sử gia đình` =
+"Không" nên **không tích ô nào**; `Phân loại thể lực` và `Phân loại Loại I–V` của
+từng cơ quan **không có trong Excel nên để nguyên**; phần **Khám cận lâm sàng
+không đụng tới**. Mục *1. Tình trạng sức khỏe* và *2. Bệnh, tật cần lưu ý* là ô chỉ
+đọc nên cột BK/BL của Excel không nhập được — Medinet tự suy ra.
+
+Tốc độ ~165s/hồ sơ (đã gồm nạp lại 5 lần để đối chiếu). Test:
+`python3 -m unittest discover -s tests` (46/46).
+
+**Đã chạy xong — `data/MAU AI NHAP LIEU  KSK.xlsx` (09/08/2026):**
+**10/10 em** đã nhập đủ 4 phần; mỗi phần **lưu xong đều nạp lại trang và đọc lại để
+đối chiếu** (`verify_*`). Tất cả đều mang ngày khám `28/07/2026`:
+
+| TT | Họ tên | CCCD | phieukhamId |
+|---|---|---|---|
+| 1 | NGUYỄN HOÀNG MINH KHANG | 079219037487 | 1360002 |
+| 2 | NGUYỄN HOÀNG KHÁNH THY | 079316000498 | 1359977 |
+| 3 | HUỲNH NGỌC THIÊN KIM | 079320021138 | 1360448 |
+| 4 | NGUYỄN NGỌC AN NHIÊN | 079319015955 | 1360003 |
+| 5 | NGUYỄN THẢO NGUYÊN | 079317000463 | 1359989 |
+| 6 | NGUYỄN BẢO ANH | 066318020155 | 1360415 |
+| 7 | TRẦN ĐẶNG ANH KHOA | 079216003246 | 1359979 |
+| 8 | TRẦN CHÍ TÂM | 079216021273 | 1360388 |
+| 9 | ĐẶNG NGUYỄN NGỌC LAM | 079319004275 | 1360432 |
+| 10 | NGÔ NGUYỄN GIA KHANG | 079216015870 | 1360384 |
+
+Năm em TT1, 2, 4, 5, 7 ban đầu **không tìm được** vì hồ sơ dạng "không đi học"
+không có Ngày khám; đã tra ID qua API rồi đặt `--exam-date 28/07/2026`, sau đó nhập
+bình thường. `cdId` **không** suy ra được từ `phieukhamId` (chênh lệch khác nhau
+giữa các hồ sơ) — phải lấy cả hai từ API.
+
+**Việc còn dở, cần người quyết:** TT4 NGUYỄN NGỌC AN NHIÊN — mục *Tâm thần* trong
+Khám lâm sàng chưa điền. Excel ghi `F90` nhưng Medinet chỉ có F90.0 / F90.1 / F90.8 /
+F90.9; chọn nhánh nào là quyết định chuyên môn. Bốn phần còn lại của em đã lưu xong.
+
+**Ba lỗi đã sửa trong đợt này, đừng để tái diễn:**
+* Số đo dùng **dấu phẩy** — `121.5` vào ô chiều cao ra 1.215 cm (`ksk_workbook.number()`).
+* Lưới giữ kết quả tìm kiếm cũ → lần chạy đầu báo sai "không tìm thấy" cho 6 em,
+  3 em trong đó có hồ sơ thật (`run_search()` giờ bắt buộc lưới đổi nội dung).
+* Radio/list render sau khung form → `pick_radio()` phải chờ và thử lại, không thì
+  câu hỏi bị bỏ trống mà không báo lỗi.
+
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.
 * **Impact**: The original importer script checked `is_form_still_open` using `.TienSu_TX_NguoiBenhLao`. Because the form stayed open (but was blank), it timed out after 15 seconds, concluding the save failed and creating duplicates during re-runs.

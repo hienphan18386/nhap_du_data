@@ -10,6 +10,9 @@ browser-cache/
 .playwright-firefox-profile/
 import_results.json
 children.json
+# Carry real students' names, CCCDs and clinical findings -- keep them local.
+clinical_results.json
+clinical_run.log
 
 # Archived one-off debug scripts -- kept locally, not pushed
 scripts/_archive/
@@ -20,5 +23,5 @@ __pycache__/
 
 # macOS
 .DS_Store
-./data/*
+data/*
 outputs/*
