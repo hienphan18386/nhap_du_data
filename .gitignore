@@ -25,3 +25,5 @@ __pycache__/
 .DS_Store
 data/*
 outputs/*
+
+*.log

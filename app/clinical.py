@@ -50,9 +50,20 @@ RESULTS_FILE = "clinical_results.json"
 
 # Gap between two vaccination picks, in milliseconds. The grids re-bind after each
 # one; too small and they come back empty, saving nothing. 120ms held over the whole
-# 38-dose schedule in testing -- lower it only with a save-and-reload check to prove
-# every dose still persists.
-VACCINE_TICK_MS = 120
+# 38-dose schedule while Medinet was responsive, but a loaded server re-binds slower
+# than that, so ticks land mid-rebind and the schedule times out half-finished --
+# that is how a run leaves "19 dòng chưa đặt được". Raise it only with a
+# save-and-reload check to prove every dose still persists.
+VACCINE_TICK_MS = 250
+
+# How long a vaccination pass may make no progress at all before it is written off.
+# A rebind on a loaded server can hide every row for seconds on end, and a pass that
+# gives up during one reports rows as unset that nothing was ever wrong with.
+VACCINE_STALL_S = 25
+
+# Hard ceiling for one vaccination pass. The pass ends as soon as the schedule is
+# complete, so this only bounds a server that has stopped answering.
+VACCINE_BUDGET_S = 300
 
 # The six nhi-khoa blocks of Khám lâm sàng: workbook key -> (checkbox class, ICD class).
 # "Thần kinh" really is wired to NoiTiet_* in Medinet's own markup -- not a typo here.
@@ -791,7 +802,8 @@ class ClinicalFiller:
                         }});
                     if (hit) {{ window.__mx.click(hit); st.misses = 0; }}
                     else {{ st.misses++; }}
-                    if (st.misses > 20) {{ st.running = false; return; }}
+                    if (st.misses > {int(VACCINE_STALL_S * 1000 / VACCINE_TICK_MS)}) {{
+                        st.running = false; return; }}
                     setTimeout(tick, {VACCINE_TICK_MS});
                 }};
                 setTimeout(tick, 0);
@@ -799,8 +811,22 @@ class ClinicalFiller:
             }})()
         """)
 
-        self._wait(lambda: not (self.js("!!window.__mxVac && window.__mxVac.running")),
-                   90, 1.0)
+        # A flat timeout here is what silently truncated the schedule on a loaded
+        # server: the pass was still working through the doses when the clock ran
+        # out, and the rows it had not reached yet got reported as unset. Wait on
+        # progress instead -- the deadline only advances the run when nothing at all
+        # is happening, so a slow server finishes and a dead one still gives up.
+        deadline = time.time() + VACCINE_BUDGET_S
+        stall_until = time.time() + VACCINE_STALL_S
+        best = -1
+        while time.time() < min(deadline, stall_until):
+            if not self.js("!!window.__mxVac && window.__mxVac.running"):
+                break
+            done = self.vaccine_state()["done"]
+            if done > best:
+                best = done
+                stall_until = time.time() + VACCINE_STALL_S
+            time.sleep(1.0)
         self.js("(function(){ if (window.__mxVac) window.__mxVac.running = false; return 1; })()")
         final = self.vaccine_state()
         return max(0, final["groups"] - final["done"])

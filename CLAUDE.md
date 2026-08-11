@@ -536,9 +536,13 @@ hiện của từng giá trị riêng biệt trong cột đó.
   Không bao giờ tự đoán nhánh — đó là quyết định chuyên môn.
 
 **Bài học vận hành:**
-* **Tiến trình chạy nền chết theo phiên Claude Code.** `nohup ... &` thì sống, còn
-  `setsid` **không có trên macOS** (dùng vào là process không khởi động nổi mà log chỉ
-  ghi `setsid: No such file or directory`). Đợt dài phải kiểm lại bằng `ps aux`.
+* **Tiến trình chạy nền chết theo phiên Claude Code.** `nohup ... &` **KHÔNG đủ** —
+  đã mất một đợt vá giữa chừng (11/08/2026) vì cả nhóm tiến trình bị dọn theo phiên.
+  `setsid` **không có trên macOS**. Cách chạy được: cho Python tự tách session
+  `subprocess.Popen([...], start_new_session=True, stdin=DEVNULL)` — nó gọi `setsid(2)`
+  nên tiến trình sang session riêng, không dính lệnh dọn của harness. Đợt dài vẫn phải
+  kiểm lại bằng `ps aux`, và **đợt nhiều em thì mỗi em một log riêng** để biết chính
+  xác em nào bị cắt giữa chừng.
 * **`clinical_results.json` bị ghi đè mỗi lần chạy** → sao lưu sau mỗi chặng. Cách đối
   chiếu tin cậy nhất là **gộp tất cả file log** rồi lấy trạng thái cuối theo từng TT.
 * **Tốc độ dao động rất mạnh** theo tải của Medinet: 130s → 870s/hồ sơ trong cùng một
