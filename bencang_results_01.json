@@ -1,0 +1,37 @@
+{
+  "file": "data/TH BEN CANG-AI NHẬP LIỆU KQ.xlsx",
+  "exam_from": "01/07/2026",
+  "exam_to": "11/08/2026",
+  "dry_run": false,
+  "updated_at": "2026-08-11T12:06:53",
+  "done": [
+    {
+      "cccd": "079219037615",
+      "name": "TĂNG GIA BẢO",
+      "stt": 1,
+      "row": 4,
+      "sections": {
+        "Tiền sử bản thân": "đã lưu",
+        "Đánh giá tâm thần - Giảm chú ý/Tăng động": "đã lưu",
+        "Đánh giá tâm thần - Phổ tự kỷ": "đã lưu",
+        "Khám lâm sàng": "đã lưu",
+        "Kết luận": "đã lưu"
+      },
+      "problems": [],
+      "status": "done",
+      "medinet_name": "TĂNG GIA BẢO",
+      "exam_date": "28/07/2026",
+      "ma_phieu": "KSKDKP260803650",
+      "ids": {
+        "phieukhamId": "1334110",
+        "cdId": "1334561"
+      },
+      "seconds": 174.1
+    }
+  ],
+  "partial": [],
+  "not_found": [],
+  "search_failed": [],
+  "no_exam_date": [],
+  "failed": []
+}

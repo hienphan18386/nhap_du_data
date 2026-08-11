@@ -73,6 +73,37 @@ DE_NGHI_NGUY_CO = "Có yếu tố nguy cơ, cần theo dõi thêm"
 # Shared JS helpers, (re)installed on every page load. Everything the filler does to a
 # DevExtreme widget goes through these: assigning .value alone never reaches the Angular
 # model, and a plain .click() does not drive a DevExtreme radio/checkbox either.
+# The backend stopped accepting the session cookie on its own -- it now answers
+# "Current user did not login to the application!" to anything without the app's own
+# Bearer header, which is why api_lookup() started coming back empty-handed and
+# children with no exam date looked like they had no record at all. The token is not
+# readable from script: localStorage keeps it encrypted, and the app runs in the page
+# world where a script sent over Apple Events cannot see its variables. But a <script>
+# tag injected into the page does run there, so this one wraps XMLHttpRequest before
+# the app makes its next call and parks the header it used in a hidden node, which the
+# controlling script can read back like any other bit of DOM.
+TOKEN_TAP_JS = r"""
+(function(){
+  if (document.getElementById('__mxtok')) return 'already';
+  var out = document.createElement('div');
+  out.id = '__mxtok';
+  out.style.display = 'none';
+  document.body.appendChild(out);
+  var s = document.createElement('script');
+  s.textContent = "(function(){var S=XMLHttpRequest.prototype.setRequestHeader;" +
+    "XMLHttpRequest.prototype.setRequestHeader=function(k,v){try{" +
+    "if(String(k).toLowerCase()==='authorization'){var n=document.getElementById('__mxtok');" +
+    "if(n)n.textContent=String(v);}}catch(e){}return S.apply(this,arguments);};" +
+    "var F=window.fetch;window.fetch=function(a,b){try{var h=b&&b.headers;" +
+    "var v=h?(h.Authorization||h.authorization||(h.get&&h.get('Authorization'))):null;" +
+    "if(v){var n=document.getElementById('__mxtok');if(n)n.textContent=String(v);}}catch(e){}" +
+    "return F.apply(this,arguments);};})();";
+  document.documentElement.appendChild(s);
+  s.remove();
+  return 'tapped';
+})()
+"""
+
 HELPERS_JS = r"""
 (function(){
   /* Medinet gives a successful save no visible acknowledgement at all: no toast, no
@@ -175,6 +206,12 @@ HELPERS_JS = r"""
       return el.value;
     },
     nfc: function(s){ return (s || '').normalize('NFC').replace(/\s+/g, ' ').trim(); },
+    /* Compare an option's visible text with a workbook answer. Case is deliberately
+       ignored: the ADHD questionnaire offers "Thỉnh thoảng" while the workbook column
+       says "thỉnh thoảng", and an exact match silently left every such question blank. */
+    same: function(a, b){
+      return window.__mx.nfc(a).toLowerCase() === window.__mx.nfc(b).toLowerCase();
+    },
     /* Pick a dxList row. When the list carries radio/checkbox decorators the row
        itself ignores synthetic clicks -- only the decorator commits the selection. */
     pickItem: function(li){
@@ -191,6 +228,16 @@ def nfc(text) -> str:
     return wb.nfc(text)
 
 
+def is_no(text) -> bool:
+    """Whether a workbook answer means "no".
+
+    Only the plain negatives count. Anything else -- including a cell that names a
+    condition instead of answering the question -- is a yes, because a Có/Không radio
+    has no third state to put it in.
+    """
+    return nfc(text).lower().strip(" .:;") in ("không", "khong", "không có", "khong co", "0")
+
+
 class ClinicalFiller:
     """Drives one Medinet record through the four clinical sections."""
 
@@ -199,6 +246,7 @@ class ClinicalFiller:
         self.exam_from = exam_from
         self.exam_to = exam_to
         self.dry_run = dry_run
+        self._token: Optional[str] = None
 
     # --- transport ----------------------------------------------------------
 
@@ -207,6 +255,7 @@ class ClinicalFiller:
 
     def install_helpers(self) -> None:
         self.js(HELPERS_JS)
+        self.js(TOKEN_TAP_JS)
 
     def goto(self, url: str, ready_class: Optional[str] = None, timeout_s: int = 40) -> bool:
         """Navigate and wait until the target form has actually rendered.
@@ -330,10 +379,10 @@ class ClinicalFiller:
             (function(){{
                 var f = window.__mx.field({js_string(cls)});
                 if (!f) return false;
-                var want = window.__mx.nfc({js_string(label)});
+                var want = {js_string(label)};
 
                 var items = Array.from(f.querySelectorAll('.dx-list-item'));
-                var li = items.find(function(e){{ return window.__mx.nfc(e.textContent) === want; }});
+                var li = items.find(function(e){{ return window.__mx.same(e.textContent, want); }});
                 if (li) {{
                     if (li.classList.contains('dx-list-item-selected')) return true;
                     window.__mx.pickItem(li);
@@ -342,7 +391,7 @@ class ClinicalFiller:
 
                 var hit = Array.from(f.querySelectorAll('.dx-radiobutton')).find(function(b){{
                     var c = b.querySelector('.dx-item-content');
-                    return window.__mx.nfc(c ? c.textContent : b.textContent) === want;
+                    return window.__mx.same(c ? c.textContent : b.textContent, want);
                 }});
                 if (!hit) return false;
                 if (hit.classList.contains('dx-radiobutton-checked')) return true;
@@ -356,14 +405,14 @@ class ClinicalFiller:
             (function(){{
                 var f = window.__mx.field({js_string(cls)});
                 if (!f) return false;
-                var want = window.__mx.nfc({js_string(label)});
+                var want = {js_string(label)};
                 var li = Array.from(f.querySelectorAll('.dx-list-item')).find(function(e){{
-                    return window.__mx.nfc(e.textContent) === want;
+                    return window.__mx.same(e.textContent, want);
                 }});
                 if (li) return li.classList.contains('dx-list-item-selected');
                 return Array.from(f.querySelectorAll('.dx-radiobutton')).some(function(b){{
                     var c = b.querySelector('.dx-item-content');
-                    return window.__mx.nfc(c ? c.textContent : b.textContent) === want
+                    return window.__mx.same(c ? c.textContent : b.textContent, want)
                         && b.classList.contains('dx-radiobutton-checked');
                 }});
             }})()
@@ -399,8 +448,12 @@ class ClinicalFiller:
 
         Each answer cell is a DevExtreme List of selectable items rather than a radio
         group, so the pick is a click on the item carrying the wanted text.
+
+        A row whose options do not include the wanted answer counts as a failure. It
+        used to be reported as success, which is how every "thỉnh thoảng" answer went
+        missing without a single complaint in the log.
         """
-        return bool(self.js(f"""
+        return self.js(f"""
             (function(){{
                 var f = window.__mx.field({js_string(cls)});
                 if (!f) return false;
@@ -409,17 +462,16 @@ class ClinicalFiller:
                 }});
                 var tr = rows[{row_index}];
                 if (!tr) return false;
-                var want = window.__mx.nfc({js_string(label)});
                 var items = Array.from(tr.querySelectorAll('.dx-list-item'));
                 var hit = items.find(function(li){{
-                    return window.__mx.nfc(li.textContent) === want;
+                    return window.__mx.same(li.textContent, {js_string(label)});
                 }});
-                if (!hit) return 'no-option';
+                if (!hit) return false;
                 if (hit.classList.contains('dx-list-item-selected')) return true;
                 window.__mx.pickItem(hit);
                 return true;
             }})()
-        """)) is not False
+        """) is True
 
     def question_rows(self, cls: str = "DanhGiaTamThan_ChiTiet") -> int:
         return self.js(f"""
@@ -443,7 +495,7 @@ class ClinicalFiller:
             }})()
         """) or 0
 
-    def select_icd(self, cls: str, codes: List[str], timeout_s: int = 15) -> List[str]:
+    def select_icd(self, cls: str, codes: List[str], timeout_s: int = 40) -> List[str]:
         """Add each ICD code to a diagnosis tag box. Returns the codes that failed.
 
         The list is server-backed: the option only exists after the search round-trips,
@@ -549,7 +601,12 @@ class ClinicalFiller:
         """)
         if current == ddmmyyyy:
             return True
-        day, month, year = ddmmyyyy.split("/")
+        parts = (ddmmyyyy or "").split("/")
+        if len(parts) != 3:
+            # An empty or malformed date reaches here when the record's own exam date
+            # could not be read; refuse it rather than crashing the whole student.
+            return False
+        day, month, year = parts
         target = f"{year}/{month}/{day}"
 
         opened = self.js(f"""
@@ -669,9 +726,21 @@ class ClinicalFiller:
             if missed:
                 problems.append(f"tiêm chủng: {missed} dòng chưa đặt được {tiem_chung!r}")
 
+        # "c) Tiền sử bệnh" is a bare Có/Không radio -- there is no box beside it for the
+        # name of the illness. The column is mostly "Không", but a row that names a
+        # condition ("ĐÃ điều trị hen suyễn dự phòng") is still answering yes, so it is
+        # filed as Có and the wording is reported back: it has nowhere to live on this
+        # form, and "d) Hiện tại có đang điều trị" is a different question with its own
+        # answer in the workbook, so it must not be written there.
         benh_tat = nfc(r["ts_benh_tat"])
-        if benh_tat and not self.pick_radio("TS_BanThan_MacBenh", benh_tat):
-            problems.append(f"không chọn được tiền sử bệnh {benh_tat!r}")
+        if benh_tat:
+            answer = "Không" if is_no(benh_tat) else "Có"
+            if not self.pick_radio("TS_BanThan_MacBenh", answer):
+                problems.append(f"không chọn được tiền sử bệnh {answer!r}")
+            elif answer == "Có" and nfc(benh_tat).lower() != "có":
+                problems.append(
+                    f"tiền sử bệnh ghi {benh_tat!r} -- form chỉ có Có/Không nên đã chọn "
+                    f"'Có'; phần chữ này không có ô để nhập")
 
         if not self.set_text("TS_BanThan_DangDieuTriBenh", r["ts_dang_dieu_tri"]):
             problems.append("không nhập được mục d) đang điều trị")
@@ -718,8 +787,7 @@ class ClinicalFiller:
                     var hit = next && Array.from(next.querySelectorAll('.dx-radiobutton'))
                         .find(function(b){{
                             var c = b.querySelector('.dx-item-content');
-                            return window.__mx.nfc(c ? c.textContent : b.textContent)
-                                 === window.__mx.nfc(want);
+                            return window.__mx.same(c ? c.textContent : b.textContent, want);
                         }});
                     if (hit) {{ window.__mx.click(hit); st.misses = 0; }}
                     else {{ st.misses++; }}
@@ -761,11 +829,26 @@ class ClinicalFiller:
 
         if not self.set_datebox("NgayDanhGia", exam_date):
             problems.append(f"không đặt được ngày đánh giá {exam_date}")
-        for i, answer in enumerate(answers):
-            if not nfc(answer):
-                continue
-            if not self.pick_list_answer("DanhGiaTamThan_ChiTiet", i, answer):
-                problems.append(f"câu {i + 1}: không chọn được {answer!r}")
+        # The list re-binds as the table settles, and a pick made mid-rebind is dropped
+        # without the click reporting anything wrong -- rows simply come back unanswered.
+        # So the whole pass is repeated until the count stops moving: each sweep skips
+        # rows that already hold the right answer, and only the ones that lost their pick
+        # get clicked again.
+        missing: List[int] = []
+        for attempt in range(3):
+            missing = []
+            for i, answer in enumerate(answers):
+                if not nfc(answer):
+                    continue
+                if not self.pick_list_answer("DanhGiaTamThan_ChiTiet", i, answer):
+                    missing.append(i)
+            answered = self.answered_rows("DanhGiaTamThan_ChiTiet")
+            if answered >= wanted:
+                break
+            if attempt < 2:
+                time.sleep(2.0)
+        for i in missing:
+            problems.append(f"câu {i + 1}: không chọn được {answers[i]!r}")
         answered = self.answered_rows("DanhGiaTamThan_ChiTiet")
         if answered < wanted:
             problems.append(f"mới trả lời {answered}/{wanted} câu")
@@ -981,11 +1064,11 @@ class ClinicalFiller:
         just saved in Khám lâm sàng, so it, not the workbook, decides."""
         problems = []
         followup = self.benh_tat_can_luu_y()
-        if followup is None:
+        if not (followup or "").strip():
             return ["không đọc được mục 2. Bệnh, tật cần lưu ý"]
 
         clean = followup.lower().strip(" .:;")
-        healthy = clean in ("không có", "khong co", "")
+        healthy = clean in ("không có", "khong co")
         wanted = DE_NGHI_BINH_THUONG if healthy else DE_NGHI_NGUY_CO
 
         self.pick_radio("DeNghi", wanted)
@@ -997,8 +1080,24 @@ class ClinicalFiller:
             problems.append("không nhập được ô Đề nghị (ghi rõ)")
         return problems
 
-    def benh_tat_can_luu_y(self) -> Optional[str]:
-        """The text Medinet computed into '2. Bệnh, tật cần lưu ý, theo dõi:'."""
+    def benh_tat_can_luu_y(self, timeout_s: float = 20.0) -> Optional[str]:
+        """The text Medinet computed into '2. Bệnh, tật cần lưu ý, theo dõi:'.
+
+        The box is filled in after the rest of the form paints, and until then it reads
+        as either a missing heading or an empty body -- an empty body being the same
+        thing a healthy child produces once loaded. Reading it too early is therefore
+        not a harmless miss: it decides "3. Đề nghị" the wrong way round and leaves the
+        Đề nghị text unwritten. A loaded box always says something ("Không có" for a
+        healthy child), so waiting for non-empty text separates the two.
+        """
+        deadline = time.time() + timeout_s
+        text = self._benh_tat_raw()
+        while not (text or "").strip() and time.time() < deadline:
+            time.sleep(1.0)
+            text = self._benh_tat_raw()
+        return text
+
+    def _benh_tat_raw(self) -> Optional[str]:
         return self.js("""
             (function(){
                 var blocks = Array.from(document.querySelectorAll('div'))
@@ -1051,8 +1150,10 @@ class ClinicalFiller:
         if san_khoa and not self.radio_checked("TS_BanThan_SanKhoa", san_khoa):
             bad.append(f"sản khoa không giữ {san_khoa!r}")
         benh_tat = nfc(r["ts_benh_tat"])
-        if benh_tat and not self.radio_checked("TS_BanThan_MacBenh", benh_tat):
-            bad.append(f"tiền sử bệnh không giữ {benh_tat!r}")
+        if benh_tat:
+            want_bt = "Không" if is_no(benh_tat) else "Có"
+            if not self.radio_checked("TS_BanThan_MacBenh", want_bt):
+                bad.append(f"tiền sử bệnh không giữ {want_bt!r}")
 
         want_dt = nfc(r["ts_dang_dieu_tri"]).replace("\n", " ")
         if want_dt and self.field_value("TS_BanThan_DangDieuTriBenh") != want_dt:
@@ -1160,7 +1261,9 @@ class ClinicalFiller:
     def verify_ket_luan(self, r: Dict) -> List[str]:
         bad = []
         followup = self.benh_tat_can_luu_y()
-        healthy = (followup or "").lower().strip(" .:;") in ("không có", "khong co", "")
+        if not (followup or "").strip():
+            return ["không đọc được mục 2. Bệnh, tật cần lưu ý để đối chiếu"]
+        healthy = followup.lower().strip(" .:;") in ("không có", "khong co")
         wanted = DE_NGHI_BINH_THUONG if healthy else DE_NGHI_NGUY_CO
         if not self.radio_checked("DeNghi", wanted):
             bad.append(f"mục 3. Đề nghị không giữ {wanted!r}")
@@ -1192,11 +1295,30 @@ class ClinicalFiller:
     API_BASE = "https://be-qlskcd.medinet.org.vn/api/services/app"
     M12_REPORT_CODE = "KSKDK_DanhSach_KSK_M12"
 
+    def auth_token(self) -> Optional[str]:
+        """The Authorization header the app itself is using, caught by TOKEN_TAP_JS.
+
+        Read fresh rather than cached: the tap re-arms on every page, and a token that
+        has been rotated is worse than none at all.
+        """
+        self.js(TOKEN_TAP_JS)
+        got = self.js("""
+            (function(){
+                var n = document.getElementById('__mxtok');
+                return n && n.textContent ? n.textContent : '';
+            })()
+        """)
+        return got or self._token
+
     def api(self, path: str, method: str = "GET", body=None, timeout_s: int = 30):
         """Call the Medinet backend from the signed-in tab and return the parsed JSON."""
         url = self.API_BASE + path
-        init = {"method": method, "credentials": "include",
-                "headers": {"Content-Type": "application/json", "Accept": "application/json"}}
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        token = self.auth_token()
+        if token:
+            self._token = token
+            headers["Authorization"] = token
+        init = {"method": method, "credentials": "include", "headers": headers}
         if body is not None:
             init["body"] = json.dumps(body, ensure_ascii=False)
         self.js(
@@ -1460,8 +1582,24 @@ class ClinicalFiller:
             return False, f"hồ sơ mở ra có CCCD {got!r}, không phải {cccd!r} -- không nhập"
         return True, self.field_value("NgayKham") or ""
 
-    def ensure_exam_date(self, ids: Dict, wanted: str,
-                         force: bool = False) -> Tuple[str, List[str]]:
+    def fill_missing_home_ward(self, ward: str) -> Tuple[bool, List[str]]:
+        """Fill "Phường/Xã" of the home address when the record has none.
+
+        Some administrative records were created without it -- typically a child whose
+        address is in another province -- and it is required, so the form refuses to
+        save anything at all, including the exam date. Only an empty field is touched:
+        an address already on file is somebody's real record, not ours to correct.
+        """
+        current = self.field_value("DiaChiHienTai_XaPhuong") or ""
+        if current.strip():
+            return False, []
+        if not self.d.select_searchable_dropdown(".DiaChiHienTai_XaPhuong", ward):
+            return False, [f"không chọn được phường/xã {ward!r}"]
+        print(f"      phường/xã nơi ở đã điền -> {ward}", flush=True)
+        return True, []
+
+    def ensure_exam_date(self, ids: Dict, wanted: str, force: bool = False,
+                         home_ward: Optional[str] = None) -> Tuple[str, List[str]]:
         """Give a record its Ngày khám on the Thông tin hành chính form.
 
         A child filed as "không đi học" can end up with no exam date at all, and the
@@ -1477,17 +1615,20 @@ class ClinicalFiller:
             return "", ["không mở được Thông tin hành chính để đặt ngày khám"]
 
         current = self.field_value("NgayKham") or ""
-        if current == wanted:
-            return current, []
-        if current and not force:
-            return current, [f"hồ sơ đã có ngày khám {current!r}, giữ nguyên "
-                             f"(dùng --force-exam-date nếu thực sự muốn đổi)"]
+        ward_filled, problems = (self.fill_missing_home_ward(home_ward)
+                                 if home_ward else (False, []))
+        if current == wanted and not ward_filled:
+            return current, problems
+        if current and current != wanted and not force:
+            return current, problems + [
+                f"hồ sơ đã có ngày khám {current!r}, giữ nguyên "
+                f"(dùng --force-exam-date nếu thực sự muốn đổi)"]
 
-        if not self.set_datebox("NgayKham", wanted):
-            return current, [f"không đặt được ngày khám {wanted}"]
+        if current != wanted and not self.set_datebox("NgayKham", wanted):
+            return current, problems + [f"không đặt được ngày khám {wanted}"]
         ok, messages = self.save("Lưu thay đổi")
         if not ok:
-            return current, [f"lưu ngày khám thất bại: {'; '.join(messages)}"]
+            return current, problems + [f"lưu ngày khám thất bại: {'; '.join(messages)}"]
 
         if not self.goto(self.section_url("dynamicform/viewer/KSKD18_TTHC", ids),
                          "DinhDanhCaNhan"):
@@ -1499,7 +1640,8 @@ class ClinicalFiller:
         return got, []
 
     def process(self, r: Dict, ids: Optional[Dict] = None,
-                set_exam_date: Optional[str] = None, force_date: bool = False) -> Dict:
+                set_exam_date: Optional[str] = None, force_date: bool = False,
+                home_ward: Optional[str] = None) -> Dict:
         """Run one student end to end. Never creates a record."""
         cccd, name = r["cccd"], r["name"]
         result = {"cccd": cccd, "name": name, "stt": r["stt"], "row": r["row"],
@@ -1515,7 +1657,7 @@ class ClinicalFiller:
             exam_date = info
             if set_exam_date:
                 exam_date, date_problems = self.ensure_exam_date(
-                    ids, set_exam_date, force_date)
+                    ids, set_exam_date, force_date, home_ward)
                 result["problems"] += date_problems
             result["exam_date"] = exam_date
             if not exam_date:
@@ -1543,7 +1685,7 @@ class ClinicalFiller:
                 exam_date = info
                 if set_exam_date:
                     exam_date, date_problems = self.ensure_exam_date(
-                        api_ids, set_exam_date, force_date)
+                        api_ids, set_exam_date, force_date, home_ward)
                     result["problems"] += date_problems
                 result["exam_date"] = exam_date
                 if not exam_date:
@@ -1579,9 +1721,16 @@ class ClinicalFiller:
         result["ids"] = ids
         if set_exam_date:
             exam_date, date_problems = self.ensure_exam_date(
-                ids, set_exam_date, force_date)
+                ids, set_exam_date, force_date, home_ward)
             result["problems"] += date_problems
             result["exam_date"] = exam_date
+        if not exam_date:
+            # Without a date there is nothing to stamp the tâm thần evaluations with,
+            # and filling the rest would leave the record half-done and hard to spot.
+            result["status"] = "no_exam_date"
+            result["problems"].append(
+                "không đọc được ngày khám của hồ sơ -- chạy lại em này")
+            return result
         return self.fill_sections(r, ids, exam_date, result)
 
     def fill_sections(self, r: Dict, ids: Dict, exam_date: str, result: Dict) -> Dict:
@@ -1619,7 +1768,7 @@ class ClinicalFiller:
 
             problems = fill() or []
             ok, messages = self.save(save_label)
-            if not ok:
+            if not ok and self.dry_run:
                 result["sections"][title] = f"lưu thất bại: {'; '.join(messages)}"
                 result["problems"] += [f"{title}: {p}" for p in problems]
                 result["problems"].append(f"{title}: {'; '.join(messages)}")
@@ -1630,12 +1779,21 @@ class ClinicalFiller:
                 result["sections"][title] = "đã điền (dry-run)"
             else:
                 # Reload and read it back: a save that did nothing looks identical to
-                # one that worked until the stored values are seen again.
+                # one that worked until the stored values are seen again. That cuts both
+                # ways -- a save that worked also looks like one that failed, because the
+                # form rebinds to an empty state afterwards and its required fields start
+                # complaining again. So the complaints only get believed if the reload
+                # shows the data really is missing.
                 if not self.goto(url, ready):
                     result["sections"][title] = "đã lưu (không mở lại được để đối chiếu)"
+                    if not ok:
+                        result["sections"][title] = f"lưu thất bại: {'; '.join(messages)}"
+                        result["problems"].append(f"{title}: {'; '.join(messages)}")
                 else:
                     left = verify() or []
                     problems += left
+                    if left and not ok:
+                        problems.append("báo lỗi khi lưu: " + "; ".join(messages))
                     result["sections"][title] = "đã lưu" if not left else "lưu thiếu"
             if problems:
                 result["problems"] += [f"{title}: {p}" for p in problems]
@@ -1668,6 +1826,10 @@ def parse_args() -> argparse.Namespace:
                    help="Ghi Ngày khám (DD/MM/YYYY) vào hồ sơ nếu đang để trống. "
                         "Cần cho em 'không đi học': không có ngày khám thì danh sách "
                         "M12 không liệt kê nên không tìm và sửa được.")
+    p.add_argument("--xa-phuong", dest="home_ward", default=None,
+                   help="Điền Phường/Xã của địa chỉ nơi ở nếu hồ sơ đang để trống. "
+                        "Ô này bắt buộc nên thiếu nó là form không lưu được gì cả, "
+                        "kể cả ngày khám. Ô đã có sẵn thì giữ nguyên.")
     p.add_argument("--force-exam-date", action="store_true",
                    help="Ghi đè cả khi hồ sơ đã có ngày khám khác (mặc định: giữ nguyên)")
     p.add_argument("--dry-run", action="store_true", help="Điền nhưng không bấm lưu")
@@ -1741,7 +1903,8 @@ def main() -> None:
         t0 = time.time()
         try:
             res = filler.process(r, ids=ids, set_exam_date=args.exam_date,
-                                 force_date=args.force_exam_date)
+                                 force_date=args.force_exam_date,
+                                 home_ward=args.home_ward)
         except Exception as exc:  # keep the batch alive; the row is logged as failed
             res = {"cccd": r["cccd"], "name": r["name"], "stt": r["stt"], "row": r["row"],
                    "status": "error", "sections": {}, "problems": [f"lỗi: {exc!r}"]}

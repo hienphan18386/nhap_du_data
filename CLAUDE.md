@@ -342,6 +342,14 @@ Lấy `pid`/`cdId` bằng cách bấm bút sửa trên lưới M2 rồi đọc U
   phải mỗi dòng một lượt AppleScript (chậm gấp bốn).
 * **Bảng câu hỏi tâm thần nạp dòng dần dần.** Điền ngay sau khi form hiện ra thì
   mất mấy câu đầu. Phải chờ đủ số dòng (`question_rows()`).
+* **So nhãn lựa chọn phải BỎ QUA HOA/THƯỜNG** — dùng `window.__mx.same()`, đừng so
+  `===`. Form ghi `Thỉnh thoảng` (T hoa) còn Excel ghi `thỉnh thoảng` (t thường), nên
+  so khớp đúng-từng-ký-tự làm **mọi câu trả lời "thỉnh thoảng" bị bỏ trống**. Nặng hơn
+  nữa: `pick_list_answer()` cũ trả về chuỗi `'no-option'` khi không thấy lựa chọn, mà
+  `'no-option' is not False` → **báo thành công**, nên lỗi bị nuốt hoàn toàn, log sạch
+  trơn. Chỉ lộ ra nhờ `verify_*` đếm số dòng đã trả lời. Quy tắc rút ra: **hàm chọn
+  phải trả về `False` khi không tìm thấy lựa chọn**, đừng bao giờ trả chuỗi rồi so
+  `is not False`. Đợt `nhap.xlsx` có 10 em dính (51 ô).
 * **Ba kiểu widget chọn một, trông giống hệt nhau:** dxRadioGroup (`.TS_BanThan_SanKhoa`)
   có nhãn trong `.dx-item-content`; dxList có trang trí radio (`.DeNghi`) thì
   **phải click vào `.dx-list-select-radiobutton`**, click vào `.dx-list-item` không
@@ -378,8 +386,9 @@ khi lưới báo `empty` — không phải làm gì thêm.
 
 Ba mảnh ghép cần nhớ:
 * Backend: `https://be-qlskcd.medinet.org.vn/api/services/app/...`, gọi bằng
-  `fetch(..., {credentials:'include'})` từ tab đã đăng nhập. **Không cần token** —
-  đừng mất công giải `localStorage['1_keys'].enc_tk` (đã mã hoá, ngõ cụt).
+  `fetch(..., {credentials:'include'})` từ tab đã đăng nhập. **Phải kèm header
+  `Authorization: Bearer ...`** — xem mục ngay dưới. (Trước 10/08/2026 chỉ cookie là
+  đủ; nay không còn đủ.)
 * Body của `PostDataWithDataOutput` là **mảng `FParameter`**, và trường tên là
   **`varible`** (backend viết sai chính tả), không phải `name`/`code`/`key`:
   `[{"varible":"KSKDK_DinhDanhCaNhan","value":"<cccd>"}]`. Tra được nhờ
@@ -388,6 +397,30 @@ Ba mảnh ghép cần nhớ:
 * `reportId` lấy qua `DRReport/GetIdByCode?code=KSKDK_DanhSach_KSK_M12` (hiện là
   1002123), `SessionSiteId` qua `User/GetSessionSiteByViewCode` (hiện 130).
   Response có đủ `phieukhamId`, `cdId`, `NgayKham`, `HoTen`, `MaPhieu`.
+
+**Lấy token Bearer (bắt buộc từ 10/08/2026) — `TOKEN_TAP_JS` + `auth_token()`:**
+Backend giờ trả `{"error":{"message":"Current user did not login to the application!"},
+"unAuthorizedRequest":true}` cho mọi request không có header `Authorization`, kể cả khi
+giao diện vẫn đăng nhập bình thường. Triệu chứng ở tầng trên: `api_lookup()` trả
+`None` cho **mọi** CCCD, nên em không có Ngày khám bị ghi nhầm là `not_found` — đúng
+cái bẫy mà API sinh ra để tránh. Nếu thấy `not_found` hàng loạt, **nghi ngờ token
+trước tiên**, đừng kết luận là hồ sơ không tồn tại.
+
+Token **không đọc được bằng script thường**: `localStorage['1_keys'].enc_tk` đã mã
+hoá, và JS chạy qua Apple Events ở isolated world nên không thấy biến của app. Cách
+lấy: chèn thẻ `<script>` vào **page world**, bọc `XMLHttpRequest.prototype.setRequestHeader`
+(và `window.fetch`), chờ app tự gọi một request rồi cất header `Authorization` vào một
+node DOM ẩn (`#__mxtok`) — controlling script đọc node đó như DOM bình thường. Toàn bộ
+đã cài trong `TOKEN_TAP_JS`, `install_helpers()` tự đặt bẫy trên mọi trang, `api()` tự
+gắn token. Không cần làm gì thêm. Đọc lại token mỗi lần gọi chứ không cache cứng, vì
+token có xoay vòng.
+
+**Quy trình cho em tìm không ra (đã dùng lại 10/08/2026, chạy tốt):**
+1. Tra `f.api_lookup(cccd)` → ra `phieukhamId`, `cdId`, và `NgayKham: None`.
+2. Chạy `python3 -m app.clinical --file <file> --only-cccd <cccd> --exam-date DD/MM/YYYY`.
+   Ngày khám đang trống sẽ được ghi vào, sau đó em hiện ra trong danh sách M12 và nhập
+   bình thường. Ngày lấy theo ngày khám của các em cùng đợt (đợt `nhap.xlsx` là
+   `28/07/2026`).
 
 `--exam-date DD/MM/YYYY` ghi Ngày khám khi ô đang trống → sau đó em đó **hiện ra
 trong danh sách M12 và tìm/sửa bình thường**. Ngày đã có sẵn thì giữ nguyên, trừ khi
@@ -451,6 +484,97 @@ F90.9; chọn nhánh nào là quyết định chuyên môn. Bốn phần còn l�
   3 em trong đó có hồ sơ thật (`run_search()` giờ bắt buộc lưới đổi nội dung).
 * Radio/list render sau khung form → `pick_radio()` phải chờ và thử lại, không thì
   câu hỏi bị bỏ trống mà không báo lỗi.
+
+### 0h. Nhập nội dung khám — cạm bẫy dùng chung cho mọi đợt
+
+Đúc kết từ đợt `data/nhap.xlsx` (10–11/08/2026, 111 hồ sơ, ngày khám `28/07/2026`,
+kết quả 105 em nhập đủ 5 phần). Viết ở đây là **quy tắc chung**, áp cho mọi file danh
+sách sau này; chi tiết riêng của từng đợt thì để trong log và `clinical_results.json`.
+
+**Ba lỗi ÂM THẦM — chạy xong không báo gì mà dữ liệu vẫn thiếu.** Đây là loại nguy
+hiểm nhất, vì log sạch trơn nên rất dễ tưởng đã xong:
+
+1. **So nhãn lựa chọn phân biệt hoa/thường.** Form ghi `Thỉnh thoảng`, Excel ghi
+   `thỉnh thoảng` → không tìm thấy lựa chọn. Luôn dùng `window.__mx.same()`
+   (NFC + lowercase), **không bao giờ dùng `===`** để so nhãn với giá trị trong Excel.
+2. **Hàm chọn trả về sentinel thay vì `False`.** `pick_list_answer()` cũ trả chuỗi
+   `'no-option'`, người gọi lại kiểm `is not False` → chuỗi non-empty lọt qua thành
+   "thành công". **Hàm chọn không tìm thấy lựa chọn thì phải trả `False`**, đừng trả
+   chuỗi rồi bắt người gọi diễn giải.
+3. **Ô rỗng bị hiểu nhầm thành một câu trả lời hợp lệ.** Ô *2. Bệnh, tật cần lưu ý*
+   do Medinet tự tính nên hiện sau phần còn lại của form; đọc sớm ra rỗng, mà rỗng lại
+   **trùng nghĩa với "trẻ khoẻ mạnh"** → chọn sai mục 3 và bỏ trống ô Đề nghị. Nguyên
+   tắc: **"chưa nạp xong" và "giá trị rỗng hợp lệ" phải là hai trạng thái khác nhau**.
+   Ở đây phân biệt được vì trẻ khoẻ mạnh luôn hiện chữ "Không có" — nên chờ tới khi ô
+   có chữ, và ô rỗng thì coi là đọc lỗi chứ không đoán.
+
+**Cách phát hiện cả ba:** chỉ có bước **nạp lại trang đọc ngược** (`verify_*`) mới bắt
+được. Nó làm chậm gấp đôi nhưng **đừng bỏ**. Dấu hiệu nhận biết lỗi loại 1–2: dòng
+`verify` báo *"chỉ lưu N/M"* mà **phía trên không có dòng lỗi nào cho từng mục** — khi
+đó hàm chọn đang nói dối, hãy so chuỗi thật trên form với giá trị trong Excel trước khi
+đổ cho chờ hụt. Cách khoanh vùng nhanh: đếm số ô thiếu và đối chiếu với số lần xuất
+hiện của từng giá trị riêng biệt trong cột đó.
+
+**Hai lỗi làm hỏng cả hồ sơ, không âm thầm nhưng dễ chẩn đoán sai:**
+
+4. **Lưu thành công bị báo nhầm là thất bại.** Lưu xong form rebind về trống nên các ô
+   bắt buộc lại kêu *"Vui lòng nhập ..."*. **Chỉ tin thông báo lỗi sau khi nạp lại
+   trang và `verify_*` xác nhận dữ liệu thiếu thật.**
+5. **Ngày rỗng lọt vào ô ngày.** Mở trang hỏng → `ensure_exam_date()` trả chuỗi rỗng →
+   `set_datebox()` vỡ giữa chừng, hồ sơ dở dang. Ô ngày phải từ chối chuỗi không đúng
+   `DD/MM/YYYY`, và hồ sơ không đọc được ngày khám thì **dừng lại báo `no_exam_date`**
+   chứ không chạy tiếp nửa vời.
+
+**Quy ước đọc dữ liệu Excel:**
+* Ô "chọn một" mà Excel ghi bằng câu chữ thay vì Có/Không: dùng `is_no()` — chỉ các từ
+  phủ định mới là "Không", **mọi thứ khác là "Có"** kèm ghi chú lại phần chữ. Không
+  bao giờ đổ phần chữ sang một ô khác, kể cả ô nghe có vẻ liên quan: đó là câu hỏi
+  khác và Excel thường đã có câu trả lời riêng cho nó.
+* **Mã ICD dạng nhóm** (không có dấu chấm, ví dụ `J03`, `F90`): Medinet chỉ có mã lá.
+  Rà trước cả file bằng `wb.icd_codes()` lọc mã không có dấu chấm, **hỏi người dùng
+  chọn nhánh**, rồi sửa thẳng ô đó trong file nguồn (nhớ sao lưu file trước khi sửa).
+  Không bao giờ tự đoán nhánh — đó là quyết định chuyên môn.
+
+**Bài học vận hành:**
+* **Tiến trình chạy nền chết theo phiên Claude Code.** `nohup ... &` thì sống, còn
+  `setsid` **không có trên macOS** (dùng vào là process không khởi động nổi mà log chỉ
+  ghi `setsid: No such file or directory`). Đợt dài phải kiểm lại bằng `ps aux`.
+* **`clinical_results.json` bị ghi đè mỗi lần chạy** → sao lưu sau mỗi chặng. Cách đối
+  chiếu tin cậy nhất là **gộp tất cả file log** rồi lấy trạng thái cuối theo từng TT.
+* **Tốc độ dao động rất mạnh** theo tải của Medinet: 130s → 870s/hồ sơ trong cùng một
+  đêm. Chậm không có nghĩa là hỏng.
+* Chạy lại từng em bằng `--only-cccd` gần như luôn cứu được hồ sơ thiếu mục — **trừ
+  khi nguyên nhân là lỗi so khớp**, khi đó chạy lại bao nhiêu lần cũng vô ích. Nếu
+  chạy lại một lần mà vẫn thiếu đúng chỗ cũ thì dừng, đi tìm lỗi so khớp.
+
+**`--xa-phuong "Phường ..."` — hồ sơ thiếu Phường/Xã nơi ở.**
+`DiaChiHienTai_XaPhuong` là ô bắt buộc; thiếu nó thì form **không lưu được gì cả**, kể
+cả ngày khám (triệu chứng: *"lưu ngày khám thất bại: Vui lòng nhập phường, xã"*).
+Thường gặp ở em có địa chỉ ở tỉnh khác. Cờ này chỉ điền khi ô đang trống, không đè lên
+địa chỉ có sẵn. **Phải hỏi người dùng phường nào, đừng suy từ phường của trường.**
+
+**Màn hình `Kiểm tra nhanh` (M11) — tra một em ở MỌI đơn vị, MỌI mẫu khám.**
+`https://quanlyskcd.medinet.org.vn/app/main/dynamicreport/report/viewer-utility/KSKNCT_KiemTraNhanh_M11`
+(reportId `1002249`, SessionSiteId `130`). Lọc theo **`CMND`** (không phải
+`DinhDanhCaNhan`): `[{"varible":"CMND","value":"<cccd>"}]`. Trả về Họ tên, Ngày sinh,
+Số điện thoại, **Ngày khám, Mẫu khám, Đơn vị khám** — nhưng **không có `phieukhamId`**,
+nên chỉ để chẩn đoán, không mở được hồ sơ từ đây.
+
+**Bắt buộc tra M11 trước khi kết luận "chưa có hồ sơ"**, vì danh sách M12 chỉ liệt kê
+hồ sơ 6–18 **của đơn vị mình**. Năm nguyên nhân "không tìm thấy" và cách xử lý:
+
+| M11 cho thấy | Nghĩa là | Làm gì |
+|---|---|---|
+| Chỉ có **phiếu dưới 6** của năm trước | Chưa có phiếu 6–18 của đợt khám này. Mẫu dưới 6 **không có 4 phần chuyên môn KSKD18** | Sửa ngày cũng vô ích — phải tạo hồ sơ hành chính bằng `importer.py` trước. Báo người dùng |
+| Có phiếu 6–18 nhưng **Đơn vị khám khác** | Em khám ở trạm khác | Bỏ qua, báo người dùng — không sửa hồ sơ của đơn vị khác |
+| Có phiếu 6–18, **Ngày khám trống** | Đúng bẫy của mục 0g | `api_lookup()` + `--exam-date DD/MM/YYYY` là chạy được |
+| **0 dòng** | CCCD trong Excel sai (hoặc em không có CCCD) | Tra lại theo họ tên. **Có kết quả cùng tên vẫn KHÔNG được tự dùng** — xem quy tắc dưới |
+| Nhiều dòng cùng tên, khác CCCD | Có thể là hai em khác nhau | Đối chiếu **ngày sinh và số điện thoại**. Lệch là hai người ⇒ hỏi người dùng |
+
+**Quy tắc bất di bất dịch:** chỉ khớp mỗi họ tên thì **không bao giờ đủ** để nhập. Đây
+là hồ sơ bệnh; nhập nhầm là ghi vào bệnh án của trẻ khác. Luôn đối chiếu thêm ngày
+sinh, và khi vẫn lệch thì đưa cả hai phương án cho người dùng chọn kèm bằng chứng
+(ngày sinh, số điện thoại, số đo thể lực có hợp với tuổi không).
 
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.
