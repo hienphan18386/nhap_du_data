@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -103,6 +104,52 @@ class ColumnMap(unittest.TestCase):
     def test_the_questionnaires_have_the_lengths_the_form_asks_for(self):
         self.assertEqual(len(wb.ADHD_COLUMNS), 18)
         self.assertEqual(len(wb.AUTISM_COLUMNS), 10)
+
+    def _sheet_with_clinical_headers(self, shift):
+        import openpyxl
+        from openpyxl.utils import get_column_letter
+
+        book = openpyxl.Workbook()
+        sheet = book.active
+        sheet.title = wb.SHEET
+        headers = {
+            "BB": "Các bệnh về mắt",
+            "BG": "Các bệnh về tai mũi họng",
+            "BJ": "Các bệnh về Răng - Hàm - Mặt",
+            "BM": "Đề nghị",
+        }
+        for expected, label in headers.items():
+            actual = get_column_letter(wb._col_index(expected) + shift)
+            sheet[f"{actual}3"] = label
+        return book, sheet
+
+    def test_detects_the_canonical_full_questionnaire_layout(self):
+        _book, sheet = self._sheet_with_clinical_headers(0)
+        self.assertEqual(wb._clinical_layout(sheet), (0, True))
+
+    def test_loads_the_short_layout_without_shifting_eye_data_into_respiratory(self):
+        import openpyxl
+
+        book, sheet = self._sheet_with_clinical_headers(-10)
+        sheet["A4"] = 1
+        sheet["B4"] = "079312056951"
+        sheet["C4"] = "LÊ ĐÀO ANH THƯ"
+        sheet["AG4"] = "Chưa phát hiện bất thường"
+        sheet["AR4"] = "Chẩn đoán sơ bộ, Ghi rõ theo mã ICD: H52.6"
+        sheet["BC4"] = "KHÔNG"
+        for letter in wb.ADHD_COLUMNS:
+            sheet[f"{letter}4"] = "Không bao giờ"
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "short.xlsx")
+            book.save(path)
+            record = wb.load_records(path)[0]
+
+        self.assertEqual(record["tuan_hoan"], "Chưa phát hiện bất thường")
+        self.assertEqual(wb.icd_codes(record["mat_benh"]), ["H52.6"])
+        self.assertNotEqual(record["ho_hap"], record["mat_benh"])
+        self.assertFalse(record["autism_available"])
+        self.assertEqual(record["autism"], [])
 
 
 if __name__ == "__main__":

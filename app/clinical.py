@@ -1760,10 +1760,11 @@ class ClinicalFiller:
         return self.fill_sections(r, ids, exam_date, result)
 
     def fill_sections(self, r: Dict, ids: Dict, exam_date: str, result: Dict) -> Dict:
-        """Fill and save the four clinical sections of an already-open record."""
+        """Fill and save the available clinical sections of an already-open record."""
         # Kết luận runs last on purpose: its "2. Bệnh, tật cần lưu ý, theo dõi" box is
         # computed by Medinet from the diagnoses already stored, so it only shows the
         # right thing once Khám lâm sàng has been saved and the page reloaded.
+        autism_title = "Đánh giá tâm thần - Phổ tự kỷ"
         plan = [
             ("Tiền sử bản thân", FORM_TIEN_SU, None, "TS_BanThan_SanKhoa",
              lambda: self.fill_tien_su(r), "Lưu thay đổi",
@@ -1772,17 +1773,25 @@ class ClinicalFiller:
              "DanhGiaTamThan_ChiTiet",
              lambda: self.fill_tam_than(r, r["adhd"], exam_date), "Lưu",
              lambda: self.verify_tam_than(r["adhd"], exam_date)),
-            ("Đánh giá tâm thần - Phổ tự kỷ", FORM_TAM_THAN, 2,
+        ]
+        if r.get("autism_available", True):
+            plan.append((autism_title, FORM_TAM_THAN, 2,
              "DanhGiaTamThan_ChiTiet",
              lambda: self.fill_tam_than(r, r["autism"], exam_date), "Lưu",
-             lambda: self.verify_tam_than(r["autism"], exam_date)),
+             lambda: self.verify_tam_than(r["autism"], exam_date)))
+        else:
+            # A shortened source workbook has no autism answers at all. Leave the
+            # existing Medinet tab untouched rather than inventing medical data or
+            # overwriting a prior assessment with an empty one.
+            result["sections"][autism_title] = "bỏ qua (file không có dữ liệu)"
+        plan.extend([
             ("Khám lâm sàng", FORM_LAM_SANG, None, "TuanHoan_ChuaPhatHienBatThuong",
              lambda: self.fill_lam_sang(r), "Lưu thay đổi",
              lambda: self.verify_lam_sang(r)),
             ("Kết luận", FORM_KET_LUAN, None, "DeNghi",
              lambda: self.fill_ket_luan(r), "Lưu thay đổi",
              lambda: self.verify_ket_luan(r)),
-        ]
+        ])
 
         for title, form, sub_tab, ready, fill, save_label, verify in plan:
             print(f"    - {title} ...", flush=True)
