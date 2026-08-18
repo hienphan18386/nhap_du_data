@@ -46,7 +46,7 @@ FORM_TAM_THAN = "dynamicviewer/tabpanel/KSKD18_TAB_DANHGIATAMTHAN"
 FORM_LAM_SANG = "dynamicform/viewer/KSKD18_ThongTinKham"
 FORM_KET_LUAN = "dynamicform/viewer/KSKD18_KetLuanKham"
 
-RESULTS_FILE = "clinical_results.json"
+RESULTS_FILE = os.environ.get("CLINICAL_RESULTS_FILE", "clinical_results.json")
 
 # Gap between two vaccination picks, in milliseconds. The grids re-bind after each
 # one; too small and they come back empty, saving nothing. 120ms held over the whole
@@ -237,6 +237,18 @@ HELPERS_JS = r"""
 
 def nfc(text) -> str:
     return wb.nfc(text)
+
+
+TOOTH_CONDITION_ALIASES = {
+    # Quy ước nhập liệu: file của người nhập dùng nhãn cũ/ngắn, trong khi
+    # biểu đồ răng M2 hiện tại của Medinet chỉ còn nhãn này.
+    "trám sâu": "Trám sâu lại",
+}
+
+
+def medinet_tooth_condition(text) -> str:
+    value = nfc(text)
+    return TOOTH_CONDITION_ALIASES.get(value.casefold(), value)
 
 
 def is_no(text) -> bool:
@@ -944,7 +956,7 @@ class ClinicalFiller:
         Only teeth the workbook actually lists are touched; every other tooth keeps
         whatever Medinet already holds.
         """
-        condition = nfc(r["tinh_trang_rang"])
+        condition = medinet_tooth_condition(r["tinh_trang_rang"])
         teeth = wb.tooth_numbers(r["cac_rang_sau"])
         if not condition or condition.lower() in ("bình thường", "binh thuong"):
             return []
@@ -959,11 +971,39 @@ class ClinicalFiller:
         return problems
 
     def set_one_tooth(self, tooth: str, condition: str, timeout_s: int = 30) -> Tuple[bool, str]:
+        condition = medinet_tooth_condition(condition)
         opened = self.js(f"""
             (function(){{
-                var f = window.__mx.field('dynamicreport8577');
-                if (!f) return 'no-chart';
-                var t = Array.from(f.querySelectorAll('.tooth')).find(function(d){{
+                // New M2 forms render the dental chart in a same-origin iframe and
+                // use a native select per tooth.  Run this in Chrome's page world so
+                // the iframe's own change handler posts the JSON back to Angular.
+                var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
+                if (frame) {{
+                    var doc = null;
+                    try {{ doc = frame.contentDocument; }} catch (e) {{}}
+                    if (!doc) return 'iframe-inaccessible';
+                    var sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
+                    if (!sel) return 'no-tooth';
+                    var want = window.__mx.nfc({js_string(condition)});
+                    var hit = Array.from(sel.options).find(function(o){{
+                        return window.__mx.nfc(o.textContent) === want;
+                    }});
+                    if (!hit) return 'no-condition';
+                    if (sel.value !== hit.value) {{
+                        sel.value = hit.value;
+                        var EventCtor = (frame.contentWindow && frame.contentWindow.Event) || Event;
+                        sel.dispatchEvent(new EventCtor('input', {{bubbles:true}}));
+                        sel.dispatchEvent(new EventCtor('change', {{bubbles:true}}));
+                    }}
+                    return sel.value === hit.value ? 'iframe-ok' : 'iframe-not-set';
+                }}
+
+                // Legacy forms used a popup chart in the main document.  Do not
+                // bind to its old generated dynamicreportNNNN id.
+                var teeth = Array.from(document.querySelectorAll('.tooth'))
+                  .filter(window.__mx.live);
+                if (!teeth.length) return 'no-chart';
+                var t = teeth.find(function(d){{
                     var n = d.querySelector('.toothNumber');
                     return n && n.textContent.trim() === {js_string(tooth)};
                 }});
@@ -974,6 +1014,9 @@ class ClinicalFiller:
                 return 'ok';
             }})()
         """)
+        if opened == "iframe-ok":
+            time.sleep(0.4)
+            return True, ""
         if opened != "ok":
             return False, str(opened)
 
@@ -1248,7 +1291,7 @@ class ClinicalFiller:
         t<N>.png whatever condition is stored. The value only appears inside the
         tooth's own popup, so each listed tooth is reopened and read.
         """
-        condition = nfc(r["tinh_trang_rang"])
+        condition = medinet_tooth_condition(r["tinh_trang_rang"])
         teeth = wb.tooth_numbers(r["cac_rang_sau"])
         if not teeth or condition.lower() in ("bình thường", "binh thuong"):
             return []
@@ -1256,7 +1299,7 @@ class ClinicalFiller:
         wrong = []
         for tooth in teeth:
             got = self.read_tooth_condition(tooth)
-            if nfc(got).lower() != condition.lower():
+            if medinet_tooth_condition(got).casefold() != condition.casefold():
                 wrong.append(f"{tooth}={got!r}")
         return [f"răng chưa lưu đúng {condition!r}: {', '.join(wrong)}"] if wrong else []
 
@@ -1264,9 +1307,20 @@ class ClinicalFiller:
         """Open a tooth's popup, read its stored condition, close it again."""
         opened = self.js(f"""
             (function(){{
-                var f = window.__mx.field('dynamicreport8577');
-                if (!f) return 'no-chart';
-                var t = Array.from(f.querySelectorAll('.tooth')).find(function(d){{
+                var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
+                if (frame) {{
+                    var doc = null;
+                    try {{ doc = frame.contentDocument; }} catch (e) {{}}
+                    if (!doc) return 'iframe-error:inaccessible';
+                    var sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
+                    if (!sel) return 'iframe-error:no-tooth';
+                    var opt = sel.options[sel.selectedIndex];
+                    return 'iframe-value:' + (opt ? opt.textContent.trim() : '');
+                }}
+                var teeth = Array.from(document.querySelectorAll('.tooth'))
+                  .filter(window.__mx.live);
+                if (!teeth.length) return 'no-chart';
+                var t = teeth.find(function(d){{
                     var e = d.querySelector('.toothNumber');
                     return e && e.textContent.trim() === {js_string(tooth)}; }});
                 var img = t && t.querySelector('img');
@@ -1275,6 +1329,10 @@ class ClinicalFiller:
                 return 'ok';
             }})()
         """)
+        if isinstance(opened, str) and opened.startswith("iframe-value:"):
+            return opened.split(":", 1)[1]
+        if isinstance(opened, str) and opened.startswith("iframe-error:"):
+            return f"<{opened}>"
         if opened != "ok":
             return f"<{opened}>"
         if not self._wait(lambda: self.field_value("ViTriRang") == tooth, timeout_s):
@@ -1296,7 +1354,13 @@ class ClinicalFiller:
         if not healthy:
             want_text = nfc(r["de_nghi"]).replace("\n", " ")
             got = self.field_text("KetLuan_DeNghi")
-            if want_text and want_text not in got:
+            # Rich-text fields collapse repeated spaces in HTML. Compare their
+            # visible wording after the same whitespace normalization so a value
+            # such as "Khám  TMH" is not reported missing after Medinet stores it
+            # as "Khám TMH".
+            want_compare = " ".join(want_text.split())
+            got_compare = " ".join(got.split())
+            if want_compare and want_compare not in got_compare:
                 bad.append(f"ô Đề nghị (ghi rõ) lưu là {got!r}, cần {want_text!r}")
         return bad
 

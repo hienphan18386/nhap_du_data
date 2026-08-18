@@ -149,6 +149,7 @@ def icd_codes(value) -> List[str]:
     'Chẩn đoán sơ bộ, Ghi rõ theo mã ICD: J35.0; J35.3' -> ['J35.0', 'J35.3']
     'Chưa phát hiện bất thường'                          -> []
     A bare 'H52.6, K02.9' (the Kết luận column) also parses.
+    The source category F90 is entered as the Medinet leaf code F90.0.
     """
     text = nfc(value)
     if not text:
@@ -157,6 +158,8 @@ def icd_codes(value) -> List[str]:
     codes = re.findall(r"\b([A-Z]\d{2}(?:\.\d+)?)\b", tail.upper())
     seen, out = set(), []
     for code in codes:
+        if code == "F90":
+            code = "F90.0"
         if code not in seen:
             seen.add(code)
             out.append(code)

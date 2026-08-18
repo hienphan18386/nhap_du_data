@@ -580,6 +580,45 @@ là hồ sơ bệnh; nhập nhầm là ghi vào bệnh án của trẻ khác. Lu
 sinh, và khi vẫn lệch thì đưa cả hai phương án cho người dùng chọn kèm bằng chứng
 (ngày sinh, số điện thoại, số đo thể lực có hợp với tuổi không).
 
+### 0i. TH Xóm Chiếu — quy tắc nhập thủ công và trạng thái lần chạy 18/08/2026
+
+Nguồn đang xử lý là workbook:
+`/Users/hienphantrong/Downloads/TH Xom Chieu_MAU AI NHAP LIEU  KSK.xlsx`.
+Người dùng yêu cầu **nhập khám sức khỏe thủ công trên hồ sơ Medinet**, không dùng
+luồng import file. Luồng này chỉ sửa các hồ sơ đã có; không tạo hồ sơ mới và không
+xoá hay sửa hồ sơ ngoài danh sách.
+
+**Quy tắc dữ liệu đã chốt:**
+* Mã ICD trần `F90` trong Excel phải nhập thành mã lá `F90.0`. Nếu Excel đã ghi
+  `F90.0` thì giữ nguyên và không tạo mã trùng.
+* Nhãn tình trạng răng `Trám sâu` (cách ghi của người nhập) phải đổi thành
+  `Trám sâu lại`, là nhãn hiện có trong biểu đồ răng Medinet. Các nhãn khác giữ
+  nguyên.
+* Biểu đồ răng M2 có thể nằm trong iframe `ksk_kham_rang_m2`; khi có iframe phải
+  chọn `.tooth-select[data-tooth=...]` và phát cả `input` lẫn `change`. Biểu đồ
+  dạng cũ trong tài liệu chính vẫn dùng fallback `.tooth`.
+* Kết quả chạy có thể đặt ở file riêng bằng biến môi trường `CLINICAL_RESULTS_FILE`
+  để các lần chạy lại không ghi đè `clinical_results.json` chung.
+
+**Công cụ chạy lại:** `scripts/retry_partial_clinical.py` đọc các kết quả `partial`,
+ưu tiên mở thẳng hồ sơ bằng cặp `phieukhamId` + `cdId`, ghi một `.log` và một
+`.json` cho từng TT, đồng thời cập nhật `manifest.json`. Không được coi việc mở
+thẳng theo ID là bằng chứng hồ sơ đã lưu thành công; vẫn phải đọc lại/verify từng
+phần.
+
+**Trạng thái lần chạy gần nhất:** hàng đợi có 55 hồ sơ. Theo
+`outputs/01a00837-8433-7af0-b650-c7d8c10aa93e/retry_dental_batch_round10/manifest.json`
+(cập nhật 18/08/2026 17:48:53), đã thử 23/55: 12 `partial`, 11 `failed`, còn 32
+`pending`. Tiến trình đã dừng theo yêu cầu khi đang ở TT287 — hồ sơ này chưa có
+file kết quả nên chưa tính vào 23 hồ sơ đã thử. Các `partial` chủ yếu còn thiếu
+biểu đồ răng do Medinet trả `no-chart`/`iframe-error:no-tooth`; 11 `failed` là
+không mở được hồ sơ theo ID tại thời điểm chạy. Vì vậy **chưa được báo hoàn tất**.
+
+Các thay đổi mã tương ứng nằm ở `app/clinical.py`, `app/ksk_workbook.py`,
+`tests/test_clinical_dental.py`, `tests/test_ksk_workbook.py` và script chạy lại ở
+`scripts/retry_partial_clinical.py`. Khi tiếp tục, phải đọc manifest trước, chạy
+từ hồ sơ `pending`, và giữ nguyên các quy tắc ở mục này.
+
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.
 * **Impact**: The original importer script checked `is_form_still_open` using `.TienSu_TX_NguoiBenhLao`. Because the form stayed open (but was blank), it timed out after 15 seconds, concluding the save failed and creating duplicates during re-runs.

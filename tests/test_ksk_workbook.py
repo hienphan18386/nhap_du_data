@@ -50,6 +50,12 @@ class IcdCodes(unittest.TestCase):
     def test_reads_a_bare_list(self):
         self.assertEqual(wb.icd_codes("E66, H52.6, K02.9"), ["E66", "H52.6", "K02.9"])
 
+    def test_maps_f90_category_to_medinet_f90_0(self):
+        self.assertEqual(wb.icd_codes("Chẩn đoán sơ bộ theo mã ICD: F90"), ["F90.0"])
+
+    def test_f90_alias_and_explicit_f90_0_collapse(self):
+        self.assertEqual(wb.icd_codes("F90, F90.0"), ["F90.0"])
+
     def test_no_finding_carries_no_code(self):
         self.assertEqual(wb.icd_codes("Chưa phát hiện bất thường"), [])
 
