@@ -163,6 +163,21 @@ HELPERS_JS = r"""
     };
   }
 
+  /* Guard against Chrome extension message noise (React DevTools, Redux, etc.)
+     which flood window with postMessage objects, causing Medinet Angular to overwrite
+     KhamRangJSON with extension data. */
+  if (!window.__mxMessageGuard) {
+    window.__mxMessageGuard = true;
+    window.addEventListener('message', function(e) {
+      if (e && e.data && typeof e.data === 'object' && !Array.isArray(e.data)) {
+        var src = String(e.data.source || e.data.type || '');
+        if (src.indexOf('react-devtools') >= 0 || src.indexOf('redux') >= 0 || src.indexOf('webpack') >= 0) {
+          e.stopImmediatePropagation();
+        }
+      }
+    }, true);
+  }
+
   window.__mx = {
     /* An element counts as live only if no ancestor is an aria-hidden tab pane --
        the tâm thần tabpanel keeps the unselected sub-tab mounted and full-height. */
@@ -295,7 +310,14 @@ class ClinicalFiller:
             if ready_class is None:
                 if self.js("document.readyState") == "complete":
                     return True
-            elif self.js(f"!!window.__mx && !!window.__mx.field({js_string(ready_class)})"):
+            elif self.js(f"""
+                (function(){{
+                    if (window.__mx && window.__mx.field({js_string(ready_class)})) return true;
+                    var el = document.querySelector('.' + {js_string(ready_class)});
+                    if (el && (el.offsetHeight > 0 || el.offsetWidth > 0 || el.querySelector('input, .dx-texteditor-input'))) return true;
+                    return false;
+                }})()
+            """):
                 return True
         return False
 
@@ -963,19 +985,108 @@ class ClinicalFiller:
         if not teeth:
             return [f"tình trạng răng {condition!r} nhưng không có danh sách răng"]
 
+        # 1. Trigger iframe chart render via native INIT_DATA postMessage if unrendered
+        self.js("""
+            (function(){
+                var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
+                if (frame && frame.contentWindow && frame.contentDocument && !frame.contentDocument.querySelector('.tooth-card')) {
+                    frame.contentWindow.postMessage({action: "INIT_DATA", payload: []}, "*");
+                }
+            })()
+        """)
+        time.sleep(0.5)
+
+        # 2. Select bulk status, click tooth cards, and apply
+        res = self.js(f"""
+            (function(){{
+                var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
+                if (!frame || !frame.contentDocument) return 'no frame';
+                var doc = frame.contentDocument;
+                var win = frame.contentWindow;
+
+                // Ensure cards exist
+                if (!doc.querySelector('.tooth-card')) {{
+                    try {{
+                        win.postMessage({{action: "INIT_DATA", payload: []}}, "*");
+                    }} catch(e) {{}}
+                }}
+
+                // Find status ID for condition
+                var wantCond = window.__mx ? window.__mx.nfc({js_string(condition)}) : {js_string(condition)};
+                var bulkSel = doc.getElementById('bulkStatusSelect');
+                var hitStatusId = '192'; // default Sâu
+                if (bulkSel) {{
+                    var hitOpt = Array.from(bulkSel.options).find(function(o){{
+                        var t = window.__mx ? window.__mx.nfc(o.textContent) : (o.textContent||'').trim();
+                        return t.toLowerCase() === wantCond.toLowerCase();
+                    }});
+                    if (hitOpt) {{
+                        hitStatusId = hitOpt.value;
+                        bulkSel.value = hitStatusId;
+                        bulkSel.dispatchEvent(new Event('change', {{bubbles:true}}));
+                    }}
+                }}
+
+                // Click target tooth cards to select them
+                var teethList = {json.dumps(teeth)};
+                var missingTeeth = [];
+                teethList.forEach(function(tooth){{
+                    var card = doc.getElementById('tooth-card-' + tooth);
+                    if (card) {{
+                        if (!card.classList.contains('is-selected')) {{
+                            card.click();
+                        }}
+                    }} else {{
+                        missingTeeth.push(tooth);
+                    }}
+                }});
+
+                // Click Áp dụng button
+                var applyBtn = doc.getElementById('applyBulkStatusBtn');
+                if (applyBtn) {{
+                    applyBtn.disabled = false;
+                    applyBtn.click();
+                }}
+
+                // Fallback: also ensure each select is explicitly set and change dispatched
+                teethList.forEach(function(tooth){{
+                    var sel = doc.querySelector('select.tooth-select[data-tooth="' + tooth + '"]');
+                    if (sel && sel.value !== hitStatusId) {{
+                        sel.value = hitStatusId;
+                        sel.dispatchEvent(new Event('input', {{bubbles:true}}));
+                        sel.dispatchEvent(new Event('change', {{bubbles:true}}));
+                    }}
+                }});
+
+                if (typeof win.buildDentalJSON === 'function') {{
+                    win.buildDentalJSON();
+                }}
+
+                return JSON.stringify({{
+                    appliedCount: doc.querySelectorAll('.tooth-card[data-status-id="' + hitStatusId + '"]').length,
+                    missingTeeth: missingTeeth
+                }});
+            }})()
+        """)
+
         problems = []
-        for tooth in teeth:
-            ok, why = self.set_one_tooth(tooth, condition)
-            if not ok:
-                problems.append(f"răng {tooth}: {why}")
+        if isinstance(res, str):
+            try:
+                data = json.loads(res)
+                for mt in data.get("missingTeeth", []):
+                    problems.append(f"răng {mt}: không tìm thấy thẻ răng")
+            except Exception:
+                if res != "ok":
+                    problems.append(f"lỗi nhập răng: {res}")
         return problems
 
     def set_one_tooth(self, tooth: str, condition: str, timeout_s: int = 30) -> Tuple[bool, str]:
         condition = medinet_tooth_condition(condition)
+
         opened = self.js(f"""
             (function(){{
                 // New M2 forms render the dental chart in a same-origin iframe and
-                // use a native select per tooth.  Run this in Chrome's page world so
+                // use a native select per tooth. Run this in Chrome's page world so
                 // the iframe's own change handler posts the JSON back to Angular.
                 var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
                 if (frame) {{
@@ -983,6 +1094,20 @@ class ClinicalFiller:
                     try {{ doc = frame.contentDocument; }} catch (e) {{}}
                     if (!doc) return 'iframe-inaccessible';
                     var sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
+                    if (!sel) {{
+                        try {{
+                            var win = frame.contentWindow;
+                            if (typeof win.renderDentalChart !== 'function') {{
+                                var scriptTag = doc.querySelector('script:not([src])');
+                                if (scriptTag) win.eval(scriptTag.innerHTML);
+                            }}
+                            if (typeof win.renderDentalChart === 'function') {{
+                                win.renderDentalChart();
+                                win.initializeBulkToolbar();
+                            }}
+                        }} catch(e) {{}}
+                        sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
+                    }}
                     if (!sel) return 'no-tooth';
                     var want = window.__mx.nfc({js_string(condition)});
                     var hit = Array.from(sel.options).find(function(o){{
@@ -994,6 +1119,11 @@ class ClinicalFiller:
                         var EventCtor = (frame.contentWindow && frame.contentWindow.Event) || Event;
                         sel.dispatchEvent(new EventCtor('input', {{bubbles:true}}));
                         sel.dispatchEvent(new EventCtor('change', {{bubbles:true}}));
+                        try {{
+                            if (frame.contentWindow && typeof frame.contentWindow.buildDentalJSON === 'function') {{
+                                frame.contentWindow.buildDentalJSON();
+                            }}
+                        }} catch(e) {{}}
                     }}
                     return sel.value === hit.value ? 'iframe-ok' : 'iframe-not-set';
                 }}
@@ -1014,6 +1144,7 @@ class ClinicalFiller:
                 return 'ok';
             }})()
         """)
+
         if opened == "iframe-ok":
             time.sleep(0.4)
             return True, ""
@@ -1305,30 +1436,45 @@ class ClinicalFiller:
 
     def read_tooth_condition(self, tooth: str, timeout_s: int = 25) -> Optional[str]:
         """Open a tooth's popup, read its stored condition, close it again."""
-        opened = self.js(f"""
-            (function(){{
-                var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
-                if (frame) {{
-                    var doc = null;
-                    try {{ doc = frame.contentDocument; }} catch (e) {{}}
-                    if (!doc) return 'iframe-error:inaccessible';
-                    var sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
-                    if (!sel) return 'iframe-error:no-tooth';
-                    var opt = sel.options[sel.selectedIndex];
-                    return 'iframe-value:' + (opt ? opt.textContent.trim() : '');
-                }}
-                var teeth = Array.from(document.querySelectorAll('.tooth'))
-                  .filter(window.__mx.live);
-                if (!teeth.length) return 'no-chart';
-                var t = teeth.find(function(d){{
-                    var e = d.querySelector('.toothNumber');
-                    return e && e.textContent.trim() === {js_string(tooth)}; }});
-                var img = t && t.querySelector('img');
-                if (!img) return 'no-tooth';
-                window.__mx.click(img);
-                return 'ok';
-            }})()
-        """)
+        # Retry loop: iframe tooth selects may still be rendering
+        iframe_retry_deadline = time.time() + 15
+        while True:
+            opened = self.js(f"""
+                (function(){{
+                    var frame = document.querySelector('iframe[src*="ksk_kham_rang_m2"]');
+                    if (frame) {{
+                        var doc = null;
+                        try {{ doc = frame.contentDocument; }} catch (e) {{}}
+                        if (!doc) return 'iframe-error:inaccessible';
+                        var sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
+                        if (!sel) {{
+                            try {{
+                                if (frame.contentWindow) {{
+                                    frame.contentWindow.postMessage({{action: "INIT_DATA", payload: []}}, "*");
+                                }}
+                            }} catch(e) {{}}
+                            sel = doc.querySelector('select.tooth-select[data-tooth="' + {js_string(tooth)} + '"]');
+                        }}
+                        if (!sel) return 'iframe-error:no-tooth';
+                        var opt = sel.options[sel.selectedIndex];
+                        return 'iframe-value:' + (opt ? opt.textContent.trim() : '');
+                    }}
+                    var teeth = Array.from(document.querySelectorAll('.tooth'))
+                      .filter(window.__mx.live);
+                    if (!teeth.length) return 'no-chart';
+                    var t = teeth.find(function(d){{
+                        var e = d.querySelector('.toothNumber');
+                        return e && e.textContent.trim() === {js_string(tooth)}; }});
+                    var img = t && t.querySelector('img');
+                    if (!img) return 'no-tooth';
+                    window.__mx.click(img);
+                    return 'ok';
+                }})()
+            """)
+            if isinstance(opened, str) and opened in ('iframe-error:no-tooth', 'iframe-error:inaccessible') and time.time() < iframe_retry_deadline:
+                time.sleep(1.0)
+                continue
+            break
         if isinstance(opened, str) and opened.startswith("iframe-value:"):
             return opened.split(":", 1)[1]
         if isinstance(opened, str) and opened.startswith("iframe-error:"):
@@ -1825,6 +1971,7 @@ class ClinicalFiller:
 
     def fill_sections(self, r: Dict, ids: Dict, exam_date: str, result: Dict) -> Dict:
         """Fill and save the available clinical sections of an already-open record."""
+        self._current_ids = ids  # stored for fill_teeth iframe-reload fallback
         # Kết luận runs last on purpose: its "2. Bệnh, tật cần lưu ý, theo dõi" box is
         # computed by Medinet from the diagnoses already stored, so it only shows the
         # right thing once Khám lâm sàng has been saved and the page reloaded.

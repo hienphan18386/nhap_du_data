@@ -6,6 +6,8 @@ the names alone are ambiguous ("Mắt phải (.../10)" appears four times, once 
 with/without-glasses pair).
 """
 
+from __future__ import annotations
+
 import re
 import unicodedata
 from typing import Dict, List, Optional

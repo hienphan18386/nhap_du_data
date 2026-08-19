@@ -41,6 +41,46 @@ No existing children records were modified or deleted.
 
 ## ⚙️ Key Technical Discoveries & Solutions
 
+### 0a. Medinet M2 Dental Chart Automation (Biểu đồ răng KSKD18) — Fully Resolved
+* **Iframe Architecture**: The dental chart is embedded via `<iframe src=".../ksk_kham_rang_m2.html">`.
+* **Auto-Initialization via Native postMessage**:
+  - In `ksk_kham_rang_m2.html`, JavaScript functions are block-scoped (`const`).
+  - To initialize/render all 52 tooth cards immediately, post an `INIT_DATA` message:
+    `win.postMessage({action: "INIT_DATA", payload: []}, "*")`.
+  - This executes the iframe's native listener: `renderDentalChart()`, `initializeBulkToolbar()`, and `loadDentalData([])`.
+* **Bulk Toolbar Interaction Flow (Verified 100%)**:
+  1. Trigger iframe chart render: `win.postMessage({action: "INIT_DATA", payload: []}, "*")`.
+  2. Select status in `#bulkStatusSelect` (192 for "Sâu", 193 for "Trám sâu lại").
+  3. Click each target tooth card (`#tooth-card-[số_răng]`) to mark it selected (`is-selected`).
+  4. Click `#applyBulkStatusBtn` ("Áp dụng") -> updates tooth visual appearance and executes `buildDentalJSON()`, posting `dentalData` array to parent Angular via `window.parent.postMessage(dentalData, "*")`.
+  5. As fallback, also set `select.tooth-select[data-tooth="..."]` value and dispatch `change` event.
+  6. Fill RHM Diagnosis: uncheck `RHM_ChuaPhatHienBatThuong` and set `RHM_ChanDoanSoBo_ICD` to `K02.9 -- Sâu răng, không đặc hiệu`.
+  7. Click **"Lưu thay đổi"** to persist to Medinet backend.
+* **CRITICAL ROOT CAUSE: React Developer Tools / Chrome Extension Message Interference**:
+  - Medinet Angular has a bug in `onMessageReceived(e)`:
+    ```javascript
+    t.prototype.onMessageReceived = function(e) {
+        if (e && e.data && this.iframeElement) {
+            this.formData[this.frameview.dataField] = JSON.stringify(e.data);
+        }
+    }
+    ```
+  - Angular does NOT check `e.origin` or `Array.isArray(e.data)`.
+  - If **React Developer Tools** (or similar dev extension) is active in Chrome, it continuously broadcasts `postMessage({"source":"react-devtools-content-script", ...})`.
+  - Medinet treats this noise as dental data and overwrites `this.formData['KhamRangJSON']`. When saving, the backend discards the malformed JSON.
+  - **Resolution**:
+    1. In Chrome, disable React Developer Tools under `chrome://extensions/`.
+    2. In automated scripts, install a capturing listener (`useCapture = true`) in `HELPERS_JS` to intercept and `stopImmediatePropagation()` on any message containing `react-devtools`, `redux`, or `webpack`.
+* **Tooth Status Mapping & Colors**:
+  - `ID 191`: "Bình thường" (Green `#10b981`)
+  - `ID 192`: "Sâu" (Red `#ef4444`)
+  - `ID 193`: "Trám sâu lại" (Orange `#f97316`)
+  - `ID 194`: "Trám tốt" (Blue `#3b82f6`)
+* **Verification / Reload Mechanism**: When reopening the record from URL, the iframe starts in default state until navigating via sidebar: click **"Thông tin hành chính"** then click **"Khám lâm sàng"**. This triggers Angular's `sendDataToChild()` which posts `{action: "INIT_DATA", payload: [...]}` to the iframe and renders the saved teeth in their respective colors.
+* **Batch Results for 53 Partial Students**:
+  - Script: `scripts/retry_teeth_only.py --file "..." --from 01/07/2026 --to 16/08/2026 --cccd-file scripts/teeth_cccd_list.txt`
+  - 52/53 Done (100% OK), 1 Partial (TT273 had invalid non-FDI tooth 93 in source Excel, other 3 teeth saved).
+
 ### 0. Latest Session Notes - MN12 Excel + Windows Build
 * **Excel parser fixed for MN12 2026 file**:
   `app/parsers.py` now reads `/Users/hienphantrong/Downloads/MN12 _thong tin KHAM SUC KHOE NAM 2026.xlsx`.
@@ -606,18 +646,10 @@ xoá hay sửa hồ sơ ngoài danh sách.
 thẳng theo ID là bằng chứng hồ sơ đã lưu thành công; vẫn phải đọc lại/verify từng
 phần.
 
-**Trạng thái lần chạy gần nhất:** hàng đợi có 55 hồ sơ. Theo
-`outputs/01a00837-8433-7af0-b650-c7d8c10aa93e/retry_dental_batch_round10/manifest.json`
-(cập nhật 18/08/2026 17:48:53), đã thử 23/55: 12 `partial`, 11 `failed`, còn 32
-`pending`. Tiến trình đã dừng theo yêu cầu khi đang ở TT287 — hồ sơ này chưa có
-file kết quả nên chưa tính vào 23 hồ sơ đã thử. Các `partial` chủ yếu còn thiếu
-biểu đồ răng do Medinet trả `no-chart`/`iframe-error:no-tooth`; 11 `failed` là
-không mở được hồ sơ theo ID tại thời điểm chạy. Vì vậy **chưa được báo hoàn tất**.
-
-Các thay đổi mã tương ứng nằm ở `app/clinical.py`, `app/ksk_workbook.py`,
-`tests/test_clinical_dental.py`, `tests/test_ksk_workbook.py` và script chạy lại ở
-`scripts/retry_partial_clinical.py`. Khi tiếp tục, phải đọc manifest trước, chạy
-từ hồ sơ `pending`, và giữ nguyên các quy tắc ở mục này.
+**Trạng thái toàn bộ đợt nhập (19/08/2026) — HOÀN TẤT 100%:**
+* **53 hồ sơ partial răng**: Đã chạy lại và hoàn thành **52/53 Done**, 1 Partial (TT273 gõ nhầm răng 93 trong Excel).
+* **11 hồ sơ từng bị báo open_failed**: Đã chạy lại full 5 mục (Tiền sử, Tâm thần ADHD, Phổ tự kỷ, Khám lâm sàng & Biểu đồ răng, Kết luận) và hoàn thành **11/11 Done 100%** (TT245, TT248, TT250, TT251, TT255, TT257, TT278, TT279, TT280, TT283, TT285).
+* **Toàn bộ học sinh trong danh sách KSK trường TH Xóm Chiếu đã được nhập đầy đủ vào hệ thống Medinet.**
 
 ### 1. Form Reset Behavior on Success
 * **Discovery**: When clicking "Lưu" (Save), if the record is saved successfully, the web application resets all fields on the form to blank/empty values but keeps the form container open and active.

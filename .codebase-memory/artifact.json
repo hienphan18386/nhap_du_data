@@ -1,11 +1,11 @@
 {
     "schema_version": 1,
-    "commit": "64c7a8e4b215e28387a5649b9857eea952528c59",
-    "indexed_at": "2026-08-18T10:57:40Z",
+    "commit": "aa3ba7da35ef8319fe534af129afde6d92bef0d6",
+    "indexed_at": "2026-08-18T11:06:03Z",
     "project": "Users-hienphantrong-Desktop-Project-AI_PROJECT-NHAP_DATA_LONG",
     "nodes": 531,
-    "edges": 1844,
+    "edges": 1781,
     "original_size": 4390912,
-    "compressed_size": 690891,
+    "compressed_size": 686625,
     "compression_level": 3
 }
