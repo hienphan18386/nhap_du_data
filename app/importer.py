@@ -1962,24 +1962,82 @@ class AppleScriptImporter(Importer):
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
     def goto(self, url: str) -> None:
-        """Point the medinet tab (or a new tab) at url in the user's own Chrome.
+        """Point the medinet tab at url without bringing Chrome to the front.
 
-        The first call finds or creates the Medinet tab without activating Chrome.
-        Every later call navigates via JavaScript (``location.assign``). No call
-        brings Chrome to the foreground, so the user can work in another app.
+        Which AppleScript verbs steal focus was measured, not guessed: `set URL of
+        tab` and `make new tab` both make Chrome frontmost and take the keyboard and
+        mouse away from whatever the user is doing, while `execute ... javascript`
+        and reading a tab's URL do not. A record opens five section pages and
+        reloads each one to read it back, so a focus-stealing navigation makes the
+        machine unusable for hours.
+
+        So navigation is always the tab's own location.assign, addressed to a tab
+        found by reading URLs. The AppleScript path survives only for the case where
+        no usable medinet tab exists, and it puts the previous application back in
+        front afterwards.
         """
-        if self._initial_activate_done:
-            # Navigate via JS -- no AppleScript window manipulation, no focus steal.
-            self.run_js(f"location.assign({js_string(url)})")
+        if self.run_js(f"location.assign({js_string(url)}); true") is True:
+            self._settle_after_navigation()
             return
 
-        # First call: reuse the tab previously dedicated to this importer. If this
-        # is the first run, prefer Chrome's active Medinet tab, mark it through
-        # window.name, and keep using that exact tab on every later JS call. This
-        # avoids accidentally controlling an older hidden Medinet tab.
+        # No marked tab yet (the first navigation of a run) or the marker was lost.
+        # Find a medinet tab and drive it with JS -- still no focus stolen.
+        marker_js = (f"window.name = {js_string(self._tab_marker)};"
+                     f" location.assign({js_string(url)}); true")
+        out = self._osascript_js(f"""
+tell application "Google Chrome"
+    repeat with w in windows
+        repeat with t in tabs of w
+            if URL of t contains "{self.SITE}" then
+                try
+                    return execute t javascript {self._as_string(marker_js)}
+                end try
+            end if
+        end repeat
+    end repeat
+    return "{self.NO_TAB}"
+end tell
+""")
+        self._tab_ref = None
+        self._initial_activate_done = True
+        if out and out not in (self.NO_TAB, "missing value", ""):
+            self._settle_after_navigation()
+            return
+
+        self._goto_last_resort(url)
+
+    def _settle_after_navigation(self, timeout_s: float = 20.0) -> None:
+        """Wait for the page asked for to actually be loaded before returning.
+
+        location.assign only starts a navigation; it returns immediately. The
+        AppleScript path this replaced ended with `delay 1`, and dropping that made
+        callers act on a document that was still the previous page or half built --
+        a record whose measurement boxes did not exist yet was saved with every one
+        of them empty and Medinet refused it with "Vui lòng nhập chiều cao (cm)".
+
+        Waiting on readyState is bounded: a page that never settles falls through
+        and the caller's own waits still apply.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.run_js("document.readyState") == "complete":
+                return
+            time.sleep(0.4)
+
+    def _goto_last_resort(self, url: str) -> None:
+        """Navigate via AppleScript when JS could not, restoring the front app after.
+
+        Only reached when no medinet tab will run JS -- a closed tab, or one sitting
+        on a page that refuses Apple Events. This is the one path that brings Chrome
+        forward, so it hands the front position straight back to whichever
+        application had it.
+        """
         marker_js = f"window.name = {js_string(self._tab_marker)}; true"
-        marker_check_js = f"window.name === {js_string(self._tab_marker)}"
         self._osascript(f"""
+set prevProc to ""
+try
+    tell application "System Events" to set prevProc to name of first process whose frontmost is true
+end try
 tell application "Google Chrome"
     if (count of windows) = 0 then make new window
     set targetTab to missing value
@@ -1987,17 +2045,8 @@ tell application "Google Chrome"
     repeat with w in windows
         repeat with t in tabs of w
             if URL of t contains "{self.SITE}" then
-                if URL of t contains "{self._tab_marker}" then
-                    set targetTab to t
-                    exit repeat
-                end if
-                try
-                    set isMarked to execute t javascript {self._as_string(marker_check_js)}
-                    if isMarked is true or isMarked is "true" then
-                        set targetTab to t
-                        exit repeat
-                    end if
-                end try
+                set targetTab to t
+                exit repeat
             end if
         end repeat
         if targetTab is not missing value then exit repeat
@@ -2005,33 +2054,29 @@ tell application "Google Chrome"
 
     if targetTab is missing value then
         try
-            set activeCandidate to active tab of window 1
-            if URL of activeCandidate contains "{self.SITE}" then set targetTab to activeCandidate
+            set targetTab to active tab of window 1
         end try
     end if
 
     if targetTab is missing value then
-        repeat with w in windows
-            repeat with t in tabs of w
-                if URL of t contains "{self.SITE}" then
-                    set targetTab to t
-                    exit repeat
-                end if
-            end repeat
-            if targetTab is not missing value then exit repeat
-        end repeat
-    end if
-
-    if targetTab is missing value then
         tell window 1 to set targetTab to make new tab with properties {{URL:{self._as_string(url)}}}
+    else
+        set URL of targetTab to {self._as_string(url)}
     end if
+    delay 1
     try
         execute targetTab javascript {self._as_string(marker_js)}
     end try
-    set URL of targetTab to {self._as_string(url)}
 end tell
+if prevProc is not "" then
+    try
+        tell application "System Events" to set frontmost of process prevProc to true
+    end try
+end if
 """)
+        self._tab_ref = None
         self._initial_activate_done = True
+        self._settle_after_navigation()
 
     def run_js(self, code: str):
         """Evaluate a JS expression in the medinet tab and JSON-decode the result.

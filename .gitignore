@@ -27,3 +27,4 @@ data/*
 outputs/*
 
 *.log
+.playwright-chrome-profile

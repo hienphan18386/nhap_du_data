@@ -1,0 +1,17 @@
+{
+ "E66": {
+  "id": 1862,
+  "as": "E66.0",
+  "why": "ma nhom; nguoi dung chon E66.0 (Beo phi do thua calo), 13 em"
+ },
+ "F66": {
+  "id": 2235,
+  "as": "F90.0",
+  "why": "TT96: F66 khong hop voi kham SK hoc sinh; de nghi ghi 'Tang van dong' -> F90.0"
+ },
+ "H62.6": {
+  "id": 2850,
+  "as": "H52.6",
+  "why": "TT136: Medinet+ICD10 khong co H62.6; chan doan mat cua em la H52.6, de nghi 'Kham mat, rang' -> go nham 5/6"
+ }
+}

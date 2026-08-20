@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -55,6 +56,14 @@ RESULTS_FILE = os.environ.get("CLINICAL_RESULTS_FILE", "clinical_results.json")
 # that is how a run leaves "19 dòng chưa đặt được". Raise it only with a
 # save-and-reload check to prove every dose still persists.
 VACCINE_TICK_MS = 250
+
+# Prefix for a message that describes the source data rather than a failure to enter
+# it. The workbook sometimes answers a Có/Không question with a sentence; the answer
+# is entered correctly and the extra wording simply has nowhere to go on the form.
+# Such a message must still reach the operator, but counting it as a defect marks a
+# fully entered section "lưu thiếu", which in turn keeps the student in the retry
+# queue for ever.
+NOTE_PREFIX = "ghi chú: "
 
 # How long a vaccination pass may make no progress at all before it is written off.
 # A rebind on a loaded server can hide every row for seconds on end, and a pass that
@@ -163,18 +172,24 @@ HELPERS_JS = r"""
     };
   }
 
-  /* Guard against Chrome extension message noise (React DevTools, Redux, etc.)
-     which flood window with postMessage objects, causing Medinet Angular to overwrite
-     KhamRangJSON with extension data. */
+  /* Medinet's Angular stores whatever any postMessage carries into KhamRangJSON --
+     it checks neither e.origin nor the shape of e.data. Every browser extension that
+     broadcasts on window therefore overwrites the dental chart. A deny-list of known
+     offenders is not enough: it listed react-devtools, redux and webpack, and
+     Wappalyzer walked straight past it and put 1995 bytes of its own inventory into
+     the field, which is why teeth marked "Sâu" came back "Bình thường".
+
+     So this is an allow-list instead. The dental iframe posts an Array of tooth
+     records; nothing else is a legitimate message for this page, and anything else is
+     stopped before Angular's own listener runs. */
   if (!window.__mxMessageGuard) {
     window.__mxMessageGuard = true;
     window.addEventListener('message', function(e) {
-      if (e && e.data && typeof e.data === 'object' && !Array.isArray(e.data)) {
-        var src = String(e.data.source || e.data.type || '');
-        if (src.indexOf('react-devtools') >= 0 || src.indexOf('redux') >= 0 || src.indexOf('webpack') >= 0) {
-          e.stopImmediatePropagation();
-        }
-      }
+      if (!e) return;
+      var d = e.data;
+      if (Array.isArray(d)) return;                       // the dental chart itself
+      if (d && typeof d === 'object' && d.action === 'INIT_DATA') return;
+      e.stopImmediatePropagation();                       // everything else is noise
     }, true);
   }
 
@@ -194,10 +209,6 @@ HELPERS_JS = r"""
     },
     click: function(el){
       if (!el) return false;
-      /* DevExtreme reads the pointer coordinates off the event, and a widget parked
-         outside the viewport (the tiêm chủng radios live in a tall scrolling grid)
-         reports negative ones, which its hit-testing rejects. Bring it into view
-         first so the synthetic pointer lands on the widget. */
       var r = el.getBoundingClientRect();
       if (r.top < 0 || r.left < 0 || r.bottom > window.innerHeight || r.right > window.innerWidth) {
         el.scrollIntoView({block: 'center', inline: 'center'});
@@ -208,13 +219,23 @@ HELPERS_JS = r"""
                clientX:r.left + r.width/2, clientY:r.top + r.height/2};
       el.dispatchEvent(new PointerEvent('pointerdown', o));
       el.dispatchEvent(new MouseEvent('mousedown', o));
-      if (el.focus) el.focus();
+      el.dispatchEvent(new FocusEvent('focusin', {bubbles:true}));
       el.dispatchEvent(new FocusEvent('focus', {bubbles:true}));
       el.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, o, {buttons:0})));
       el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, o, {buttons:0})));
       el.dispatchEvent(new MouseEvent('click', Object.assign({}, o, {buttons:0})));
       return true;
     },
+    /* Types into a DevExtreme editor and deliberately LEAVES THE FIELD FOCUSED.
+       Do not end this with blur/focusout, and do not swap el.focus() for synthetic
+       focus events: the server-backed lookups (ICD tag boxes, the grid's CCCD and
+       date search) only render their drop-down while the input really holds focus,
+       and blurring cancels the pending search. A version that dispatched focus
+       events instead of focusing, then blurred at the end, closed the list the
+       instant it was typed into -- 424 ICD codes across one 270-student run were
+       reported as "không chọn được", with the drop-down never showing a single
+       option. Callers that DO want the value committed on blur (set_number,
+       set_text) dispatch their own blur right after calling this. */
     type: function(el, text){
       if (!el) return false;
       el.focus();
@@ -229,6 +250,34 @@ HELPERS_JS = r"""
         el.dispatchEvent(new KeyboardEvent('keyup', {key:ch, bubbles:true}));
       }
       el.dispatchEvent(new Event('change', {bubbles:true}));
+      return el.value;
+    },
+    /* Types into a plain editor (number box, text box) and commits the value.
+
+       This is the sequence that DevExtreme number boxes actually accept, kept
+       separate from type() on purpose. The two cannot share one implementation:
+       a lookup must stay focused so its server-backed drop-down survives, while a
+       number box only hands its text to the model on focusout. Using the lookup
+       sequence here left every measurement box holding text the model never saw and
+       Medinet refused the save with "Vui lòng nhập chiều cao (cm)"; using this
+       sequence for a lookup closed the drop-down before any option could load. */
+    typeField: function(el, text){
+      if (!el) return false;
+      el.dispatchEvent(new FocusEvent('focusin', {bubbles:true}));
+      el.dispatchEvent(new FocusEvent('focus', {bubbles:true}));
+      el.value = '';
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      for (var i = 0; i < text.length; i++) {
+        var ch = text[i];
+        el.dispatchEvent(new KeyboardEvent('keydown', {key:ch, bubbles:true}));
+        el.dispatchEvent(new KeyboardEvent('keypress', {key:ch, bubbles:true}));
+        el.value += ch;
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        el.dispatchEvent(new KeyboardEvent('keyup', {key:ch, bubbles:true}));
+      }
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+      el.dispatchEvent(new FocusEvent('focusout', {bubbles:true}));
+      el.dispatchEvent(new FocusEvent('blur', {bubbles:true}));
       return el.value;
     },
     nfc: function(s){ return (s || '').normalize('NFC').replace(/\s+/g, ' ').trim(); },
@@ -259,6 +308,16 @@ TOOTH_CONDITION_ALIASES = {
     # biểu đồ răng M2 hiện tại của Medinet chỉ còn nhãn này.
     "trám sâu": "Trám sâu lại",
 }
+
+
+def medinet_san_khoa(text) -> str:
+    value = nfc(text).strip()
+    if not value:
+        return ""
+    val_lower = value.lower()
+    if val_lower in ("bình thường", "binh thuong", "thường", "thuong", "đẻ thường", "de thuong"):
+        return "Bình thường"
+    return "Không bình thường"
 
 
 def medinet_tooth_condition(text) -> str:
@@ -323,6 +382,21 @@ class ClinicalFiller:
 
     # --- widget primitives --------------------------------------------------
 
+    def wait_field(self, cls: str, timeout_s: float = 20.0) -> bool:
+        """Wait for one widget to exist, for blocks that render after the form is 'ready'.
+
+        A section is declared ready by a single marker widget, but these forms build
+        their groups progressively, so a later group can still be missing when filling
+        starts. Waiting costs nothing once the widget is there and only runs its clock
+        when something really is absent.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.js(f"!!(window.__mx && window.__mx.field({js_string(cls)}))"):
+                return True
+            time.sleep(0.5)
+        return False
+
     def set_number(self, cls: str, value) -> bool:
         text = wb.number(value)
         if text is None:
@@ -333,9 +407,16 @@ class ClinicalFiller:
                 if (!f) return false;
                 var i = f.querySelector('input.dx-texteditor-input');
                 if (!i) return false;
-                window.__mx.type(i, {js_string(text)});
+                var valNum = parseFloat({js_string(text)}.replace(',', '.'));
+                try {{
+                    var nb = f.querySelector('.dx-numberbox') || i.closest('.dx-numberbox');
+                    if (nb && window.DevExpress && window.DevExpress.ui && window.DevExpress.ui.dxNumberBox) {{
+                        var inst = window.DevExpress.ui.dxNumberBox.getInstance(nb);
+                        if (inst) inst.option('value', valNum);
+                    }}
+                }} catch(e) {{}}
+                window.__mx.typeField(i, {js_string(text)});
                 i.dispatchEvent(new Event('blur', {{bubbles:true}}));
-                i.blur();
                 return true;
             }})()
         """))
@@ -357,26 +438,27 @@ class ClinicalFiller:
 
                 var ql = f.querySelector('.ql-editor[contenteditable], [contenteditable="true"]');
                 if (ql) {{
-                    ql.focus();
-                    var sel = window.getSelection();
-                    var rng = document.createRange();
-                    rng.selectNodeContents(ql);
-                    sel.removeAllRanges();
-                    sel.addRange(rng);
-                    document.execCommand('delete', false, null);
-                    document.execCommand('insertText', false, {js_string(text)});
+                    try {{
+                        if (window.DevExpress && window.DevExpress.ui && window.DevExpress.ui.dxHtmlEditor) {{
+                            var he = f.querySelector('.dx-htmleditor') || f;
+                            var heInst = window.DevExpress.ui.dxHtmlEditor.getInstance(he);
+                            if (heInst) {{
+                                heInst.option('value', {js_string(text)});
+                                return true;
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                    ql.innerText = {js_string(text)};
                     ql.dispatchEvent(new InputEvent('input', {{bubbles:true, inputType:'insertText'}}));
                     ql.dispatchEvent(new Event('change', {{bubbles:true}}));
                     ql.dispatchEvent(new Event('blur', {{bubbles:true}}));
-                    ql.blur();
                     return true;
                 }}
 
                 var i = f.querySelector('textarea, input.dx-texteditor-input');
                 if (!i) return false;
-                window.__mx.type(i, {js_string(text)});
+                window.__mx.typeField(i, {js_string(text)});
                 i.dispatchEvent(new Event('blur', {{bubbles:true}}));
-                i.blur();
                 return true;
             }})()
         """))
@@ -426,17 +508,48 @@ class ClinicalFiller:
                 if (!f) return false;
                 var want = {js_string(label)};
 
+                function matchOpt(txt, w) {{
+                    if (!txt || !w) return false;
+                    var t = window.__mx.nfc(txt).toLowerCase().trim();
+                    var wt = window.__mx.nfc(w).toLowerCase().trim();
+                    if (t === wt) return true;
+                    if (t.indexOf(wt) !== -1 || wt.indexOf(t) !== -1) return true;
+                    if ((wt.indexOf('can thiệp') !== -1 || wt.indexOf('ngạt') !== -1) && (t.indexOf('can thiệp') !== -1 || t.indexOf('ngạt') !== -1)) return true;
+                    if ((wt.indexOf('bình thường') !== -1 || wt.indexOf('thường') !== -1) && (t.indexOf('bình thường') !== -1 || t.indexOf('thường') !== -1)) return true;
+                    if ((wt.indexOf('thiếu tháng') !== -1 || wt.indexOf('non') !== -1) && (t.indexOf('thiếu tháng') !== -1 || t.indexOf('non') !== -1)) return true;
+                    if (wt.indexOf('mổ') !== -1 && t.indexOf('mổ') !== -1) return true;
+                    return false;
+                }}
+
                 var items = Array.from(f.querySelectorAll('.dx-list-item'));
-                var li = items.find(function(e){{ return window.__mx.same(e.textContent, want); }});
+                var li = items.find(function(e){{ return matchOpt(e.textContent, want); }});
                 if (li) {{
                     if (li.classList.contains('dx-list-item-selected')) return true;
                     window.__mx.pickItem(li);
                     return true;
                 }}
 
+                var rg = f.querySelector('.dx-radiogroup') || f;
+                try {{
+                    if (window.DevExpress && window.DevExpress.ui && window.DevExpress.ui.dxRadioGroup) {{
+                        var inst = window.DevExpress.ui.dxRadioGroup.getInstance(rg);
+                        if (inst) {{
+                            var rItems = inst.option('items') || [];
+                            var foundItem = rItems.find(function(it){{
+                                var txt = typeof it === 'object' ? (it.text || it.name || it.label || '') : String(it);
+                                return matchOpt(txt, want);
+                            }});
+                            if (foundItem) {{
+                                var val = typeof foundItem === 'object' ? (foundItem.value !== undefined ? foundItem.value : (foundItem.id !== undefined ? foundItem.id : foundItem)) : foundItem;
+                                inst.option('value', val);
+                            }}
+                        }}
+                    }}
+                }} catch(e) {{}}
+
                 var hit = Array.from(f.querySelectorAll('.dx-radiobutton')).find(function(b){{
                     var c = b.querySelector('.dx-item-content');
-                    return window.__mx.same(c ? c.textContent : b.textContent, want);
+                    return matchOpt(c ? c.textContent : b.textContent, want);
                 }});
                 if (!hit) return false;
                 if (hit.classList.contains('dx-radiobutton-checked')) return true;
@@ -451,13 +564,47 @@ class ClinicalFiller:
                 var f = window.__mx.field({js_string(cls)});
                 if (!f) return false;
                 var want = {js_string(label)};
+
+                function matchOpt(txt, w) {{
+                    if (!txt || !w) return false;
+                    var t = window.__mx.nfc(txt).toLowerCase().trim();
+                    var wt = window.__mx.nfc(w).toLowerCase().trim();
+                    if (t === wt) return true;
+                    if (t.indexOf(wt) !== -1 || wt.indexOf(t) !== -1) return true;
+                    if ((wt.indexOf('can thiệp') !== -1 || wt.indexOf('ngạt') !== -1) && (t.indexOf('can thiệp') !== -1 || t.indexOf('ngạt') !== -1)) return true;
+                    if ((wt.indexOf('bình thường') !== -1 || wt.indexOf('thường') !== -1) && (t.indexOf('bình thường') !== -1 || t.indexOf('thường') !== -1)) return true;
+                    if ((wt.indexOf('thiếu tháng') !== -1 || wt.indexOf('non') !== -1) && (t.indexOf('thiếu tháng') !== -1 || t.indexOf('non') !== -1)) return true;
+                    if (wt.indexOf('mổ') !== -1 && t.indexOf('mổ') !== -1) return true;
+                    return false;
+                }}
+
                 var li = Array.from(f.querySelectorAll('.dx-list-item')).find(function(e){{
-                    return window.__mx.same(e.textContent, want);
+                    return matchOpt(e.textContent, want);
                 }});
                 if (li) return li.classList.contains('dx-list-item-selected');
+
+                var rg = f.querySelector('.dx-radiogroup') || f;
+                try {{
+                    if (window.DevExpress && window.DevExpress.ui && window.DevExpress.ui.dxRadioGroup) {{
+                        var inst = window.DevExpress.ui.dxRadioGroup.getInstance(rg);
+                        if (inst && inst.option('value') !== undefined && inst.option('value') !== null) {{
+                            var val = inst.option('value');
+                            var rItems = inst.option('items') || [];
+                            var curItem = rItems.find(function(it){{
+                                var itVal = typeof it === 'object' ? (it.value !== undefined ? it.value : (it.id !== undefined ? it.id : it)) : it;
+                                return itVal === val;
+                            }});
+                            if (curItem) {{
+                                var txt = typeof curItem === 'object' ? (curItem.text || curItem.name || curItem.label || '') : String(curItem);
+                                if (matchOpt(txt, want)) return true;
+                            }}
+                        }}
+                    }}
+                }} catch(e) {{}}
+
                 return Array.from(f.querySelectorAll('.dx-radiobutton')).some(function(b){{
                     var c = b.querySelector('.dx-item-content');
-                    return window.__mx.same(c ? c.textContent : b.textContent, want)
+                    return matchOpt(c ? c.textContent : b.textContent, want)
                         && b.classList.contains('dx-radiobutton-checked');
                 }});
             }})()
@@ -548,19 +695,29 @@ class ClinicalFiller:
         """
         failed: List[str] = []
         self.icd_choices: Dict[str, List[str]] = {}
+        # Why each failure happened, so a silent drop-down never again hides behind the
+        # same message as a code Medinet genuinely does not carry.
+        self.icd_why: Dict[str, str] = {}
         for code in codes:
             if self.icd_has(cls, code):
                 continue
-            self.js(f"""
+            typed = self.js(f"""
                 (function(){{
                     var f = window.__mx.field({js_string(cls)});
-                    if (!f) return false;
+                    if (!f) return 'no-field';
                     var i = f.querySelector('input.dx-texteditor-input');
-                    if (!i) return false;
+                    if (!i) return 'no-input';
                     window.__mx.type(i, {js_string(code)});
-                    return true;
+                    return 'typed';
                 }})()
             """)
+            if typed != 'typed':
+                self.icd_why[code] = ('không tìm thấy ô nhập mã ICD trên form'
+                                      if typed == 'no-field' else
+                                      'ô mã ICD không có chỗ gõ')
+                failed.append(code)
+                continue
+            saw_items = False
             picked = False
             deadline = time.time() + timeout_s
             while time.time() < deadline:
@@ -581,9 +738,11 @@ class ClinicalFiller:
                     }})()
                 """)
                 if got == "picked":
+                    saw_items = True
                     picked = True
                     break
                 if isinstance(got, str) and got.startswith("no-match"):
+                    saw_items = True
                     # The catalogue offers something, just not this exact code -- almost
                     # always because the workbook names a category (F90) where Medinet
                     # only carries its leaves (F90.0, F90.1, ...). Which leaf applies is
@@ -615,6 +774,14 @@ class ClinicalFiller:
             """)
             time.sleep(0.5)
             if not (picked and self.icd_has(cls, code)):
+                if not saw_items:
+                    # Nothing was ever offered. The catalogue is server-backed, so this
+                    # means the search never ran or its drop-down was closed again --
+                    # not that the code is missing from Medinet.
+                    self.icd_why[code] = (f"gõ {code} nhưng danh sách gợi ý không hiện ra "
+                                          f"sau {timeout_s}s")
+                elif picked:
+                    self.icd_why[code] = "chọn xong nhưng mã không bám vào ô"
                 failed.append(code)
         return failed
 
@@ -705,25 +872,36 @@ class ClinicalFiller:
     # --- saving -------------------------------------------------------------
 
     def validation_messages(self) -> List[str]:
+        """Validation text that reflects the form's current state.
+
+        DevExtreme keeps a message node per editor and does not always remove it
+        once the editor becomes valid again, so reading the text alone reports
+        failures that are not happening. A saved Tiền sử section was rejected this
+        way -- all six measurements present and correct, no editor carrying
+        dx-invalid, yet twelve "Vui lòng nhập ..." nodes still in the page. The
+        editors themselves are the authority: while nothing is marked dx-invalid,
+        those nodes are leftovers. Toasts are different -- they carry server
+        replies, which no field state reflects -- so they always count.
+        """
         return self.js("""
             (function(){
-                return Array.from(document.querySelectorAll(
-                    '.dx-validationsummary-item, .dx-invalid-message-content, .dx-toast-message'))
-                  .filter(window.__mx.live)
-                  .map(function(e){ return window.__mx.nfc(e.textContent); })
-                  .filter(function(t){ return t; });
+                var text = function(sel){
+                    return Array.from(document.querySelectorAll(sel))
+                      .filter(window.__mx.live)
+                      .map(function(e){ return window.__mx.nfc(e.textContent); })
+                      .filter(function(t){ return t; });
+                };
+                var out = text('.dx-toast-message');
+                if (document.querySelectorAll('.dx-invalid').length) {
+                    out = out.concat(
+                        text('.dx-validationsummary-item, .dx-invalid-message-content'));
+                }
+                return out;
             })()
         """) or []
 
-    def save(self, label: str, settle_s: int = 12) -> Tuple[bool, List[str]]:
-        """Press a section's save button.
-
-        Medinet acknowledges a successful save with nothing at all -- no toast, no
-        banner, no URL change -- while leaving the "Vui lòng nhập ..." nodes from the
-        initial empty render in the DOM. So this only reports that the click reached
-        the widget and collects any NEW validation complaint; whether the data actually
-        landed is settled by reloading the section and reading it back (see verify_*).
-        """
+    def save(self, label: str, settle_s: float = 1.5) -> Tuple[bool, List[str]]:
+        """Press a section's save button."""
         if self.dry_run:
             return True, ["dry-run: không bấm lưu"]
 
@@ -761,7 +939,7 @@ class ClinicalFiller:
         if family and family.lower() not in ("không", "khong", "không có"):
             problems.append(f"tiền sử gia đình {family!r} chưa có quy tắc -- bỏ trống")
 
-        san_khoa = nfc(r["ts_san_khoa"])
+        san_khoa = medinet_san_khoa(r["ts_san_khoa"])
         if san_khoa and not self.pick_radio("TS_BanThan_SanKhoa", san_khoa):
             problems.append(f"không chọn được sản khoa {san_khoa!r}")
 
@@ -784,12 +962,20 @@ class ClinicalFiller:
                 problems.append(f"không chọn được tiền sử bệnh {answer!r}")
             elif answer == "Có" and nfc(benh_tat).lower() != "có":
                 problems.append(
+                    NOTE_PREFIX +
                     f"tiền sử bệnh ghi {benh_tat!r} -- form chỉ có Có/Không nên đã chọn "
                     f"'Có'; phần chữ này không có ô để nhập")
 
         if not self.set_text("TS_BanThan_DangDieuTriBenh", r["ts_dang_dieu_tri"]):
             problems.append("không nhập được mục d) đang điều trị")
 
+        # Khám thể lực sits below Tiền sử on the same form and renders later, while
+        # the section is declared ready as soon as TS_BanThan_SanKhoa exists. On a
+        # loaded server the six measurement boxes are still absent at that point, so
+        # every one of them silently fails to take a value and Medinet rejects the
+        # save with "Vui lòng nhập chiều cao (cm)". Wait for the block itself.
+        if not self.wait_field("TheLuc_ChieuCao"):
+            problems.append("khối Khám thể lực không hiện ra để nhập số đo")
         for cls, key in (("TheLuc_ChieuCao", "chieu_cao"),
                          ("TheLuc_CanNang", "can_nang"),
                          ("TheLuc_Mach", "mach"),
@@ -821,6 +1007,15 @@ class ClinicalFiller:
                 var want = {js_string(answer)};
                 var st = window.__mxVac = {{done: 0, total: 0, misses: 0, running: true}};
                 var tick = function(){{
+                    /* The stop flag is checked here, at the top of every tick, so the
+                       controller can actually end this pass. Without it setting
+                       st.running = false did nothing: the setTimeout chain kept
+                       clicking vaccination rows while the next steps typed the six
+                       measurement boxes, and every click re-bound the grid and reset
+                       the form model underneath them -- the save then failed with
+                       "Vui lòng nhập chiều cao (cm)" even though the values had just
+                       been entered. */
+                    if (!st.running) return;
                     var f = window.__mx.field('KSKD18_TiemChung_Json');
                     var groups = f ? Array.from(f.querySelectorAll('.dx-radiogroup')) : [];
                     st.total = groups.length || st.total;
@@ -861,7 +1056,10 @@ class ClinicalFiller:
                 best = done
                 stall_until = time.time() + VACCINE_STALL_S
             time.sleep(1.0)
+        # Stop the in-page pass and give any tick already scheduled time to see the
+        # flag and return, so nothing is still clicking when the next field is typed.
         self.js("(function(){ if (window.__mxVac) window.__mxVac.running = false; return 1; })()")
+        time.sleep(VACCINE_TICK_MS / 1000.0 + 0.3)
         final = self.vaccine_state()
         return max(0, final["groups"] - final["done"])
 
@@ -881,32 +1079,37 @@ class ClinicalFiller:
         """One sub-tab of section 2: the evaluation date plus every question."""
         problems = []
         wanted = len([a for a in answers if nfc(a)])
-        # The questionnaire table streams its rows in after the surrounding form is
-        # already present, so filling straight away silently drops the first few
-        # questions -- their row simply does not exist yet at that moment.
-        if not self._wait(lambda: self.question_rows() >= wanted, 60):
+        if not self._wait(lambda: self.question_rows() >= wanted, 30):
             problems.append(f"bảng câu hỏi chỉ nạp được {self.question_rows()}/{wanted} dòng")
 
         if not self.set_datebox("NgayDanhGia", exam_date):
             problems.append(f"không đặt được ngày đánh giá {exam_date}")
-        # The list re-binds as the table settles, and a pick made mid-rebind is dropped
-        # without the click reporting anything wrong -- rows simply come back unanswered.
-        # So the whole pass is repeated until the count stops moving: each sweep skips
-        # rows that already hold the right answer, and only the ones that lost their pick
-        # get clicked again.
-        missing: List[int] = []
-        for attempt in range(3):
-            missing = []
-            for i, answer in enumerate(answers):
-                if not nfc(answer):
-                    continue
-                if not self.pick_list_answer("DanhGiaTamThan_ChiTiet", i, answer):
-                    missing.append(i)
-            answered = self.answered_rows("DanhGiaTamThan_ChiTiet")
-            if answered >= wanted:
-                break
-            if attempt < 2:
-                time.sleep(2.0)
+
+        ans_clean = [nfc(a) for a in answers]
+        missing = self.js(f"""
+            (function(){{
+                var f = window.__mx.field('DanhGiaTamThan_ChiTiet');
+                if (!f) return [];
+                var answers = {json.dumps(ans_clean, ensure_ascii=False)};
+                var rows = Array.from(f.querySelectorAll('tr')).filter(function(tr){{
+                    return tr.querySelector('.dx-list-item');
+                }});
+                var miss = [];
+                answers.forEach(function(ans, i){{
+                    if (!ans) return;
+                    var tr = rows[i];
+                    if (!tr) {{ miss.push(i); return; }}
+                    var items = Array.from(tr.querySelectorAll('.dx-list-item'));
+                    var hit = items.find(function(li){{ return window.__mx.same(li.textContent, ans); }});
+                    if (!hit) {{ miss.push(i); return; }}
+                    if (!hit.classList.contains('dx-list-item-selected')) {{
+                        window.__mx.pickItem(hit);
+                    }}
+                }});
+                return miss;
+            }})()
+        """) or []
+
         for i in missing:
             problems.append(f"câu {i + 1}: không chọn được {answers[i]!r}")
         answered = self.answered_rows("DanhGiaTamThan_ChiTiet")
@@ -969,7 +1172,9 @@ class ClinicalFiller:
                 notes.append(f"{what}: Medinet không có mã {code} -- chọn tay một trong: "
                              + " | ".join(choices))
             else:
-                notes.append(f"{what}: không chọn được mã ICD {code}")
+                why = getattr(self, "icd_why", {}).get(code)
+                notes.append(f"{what}: không chọn được mã ICD {code}"
+                             + (f" -- {why}" if why else ""))
         return notes
 
     def fill_teeth(self, r: Dict) -> List[str]:
@@ -1343,10 +1548,19 @@ class ClinicalFiller:
             if want is None:
                 continue
             got = self.field_value(cls)
-            if got != want:
+            if got is None or not got:
                 bad.append(f"{label} lưu là {got!r}, cần {want!r}")
+                continue
+            got_clean = got.replace(",", ".").strip()
+            want_clean = want.replace(",", ".").strip()
+            try:
+                if float(got_clean) != float(want_clean):
+                    bad.append(f"{label} lưu là {got!r}, cần {want!r}")
+            except ValueError:
+                if got_clean != want_clean:
+                    bad.append(f"{label} lưu là {got!r}, cần {want!r}")
 
-        san_khoa = nfc(r["ts_san_khoa"])
+        san_khoa = medinet_san_khoa(r["ts_san_khoa"])
         if san_khoa and not self.radio_checked("TS_BanThan_SanKhoa", san_khoa):
             bad.append(f"sản khoa không giữ {san_khoa!r}")
         benh_tat = nfc(r["ts_benh_tat"])
@@ -1511,6 +1725,23 @@ class ClinicalFiller:
         return bad
 
     # --- record orchestration ----------------------------------------------
+
+    def date_in_window(self, ddmmyyyy: str) -> bool:
+        """True when a DD/MM/YYYY exam date falls inside the requested range.
+
+        An unparseable date is treated as outside: the caller uses this to decide
+        whether writing into a record is safe, and a date it cannot read is not a
+        date it may act on.
+        """
+        def parse(v):
+            try:
+                return datetime.strptime(nfc(v).strip(), "%d/%m/%Y").date()
+            except (ValueError, AttributeError):
+                return None
+        got, lo, hi = parse(ddmmyyyy), parse(self.exam_from), parse(self.exam_to)
+        if not got or not lo or not hi:
+            return False
+        return lo <= got <= hi
 
     @staticmethod
     def _wait(condition, timeout_s: float, interval_s: float = 0.5) -> bool:
@@ -1911,6 +2142,18 @@ class ClinicalFiller:
             if via_api:
                 print(f"      lưới không có, tra qua API: phieukhamId={via_api['phieukhamId']}"
                       f" ngày khám={via_api['exam'] or 'trống'}", flush=True)
+                # The API fallback exists for a child whose record carries NO exam date,
+                # because the M12 screen cannot list one. A record that does carry a date
+                # outside the requested window is a different thing entirely -- an older
+                # round, usually a previous year -- and filling this year's examination
+                # into it would overwrite another visit's record. Refuse it.
+                if via_api["exam"] and not self.date_in_window(via_api["exam"]):
+                    result["status"] = "khac_dot_kham"
+                    result["problems"].append(
+                        f"API tìm thấy hồ sơ ngày khám {via_api['exam']}, ngoài khoảng "
+                        f"{self.exam_from} - {self.exam_to} -- gần như chắc chắn là phiếu "
+                        f"của đợt khám khác, KHÔNG nhập để khỏi ghi đè hồ sơ cũ")
+                    return result
                 api_ids = {"phieukhamId": via_api["phieukhamId"], "cdId": via_api["cdId"]}
                 ok, info = self.open_by_ids(cccd, api_ids)
                 if not ok:
@@ -2014,6 +2257,7 @@ class ClinicalFiller:
 
             problems = fill() or []
             ok, messages = self.save(save_label)
+
             if not ok and self.dry_run:
                 result["sections"][title] = f"lưu thất bại: {'; '.join(messages)}"
                 result["problems"] += [f"{title}: {p}" for p in problems]
@@ -2029,7 +2273,9 @@ class ClinicalFiller:
                 # ways -- a save that worked also looks like one that failed, because the
                 # form rebinds to an empty state afterwards and its required fields start
                 # complaining again. So the complaints only get believed if the reload
-                # shows the data really is missing.
+                # shows the data really is missing. Dropping this step is what turned a
+                # working Tiền sử save into "Vui lòng nhập chiều cao (cm)": the save-time
+                # message became the only judge, and it lies in both directions.
                 if not self.goto(url, ready):
                     result["sections"][title] = "đã lưu (không mở lại được để đối chiếu)"
                     if not ok:
@@ -2040,7 +2286,11 @@ class ClinicalFiller:
                     problems += left
                     if left and not ok:
                         problems.append("báo lỗi khi lưu: " + "; ".join(messages))
-                    result["sections"][title] = "đã lưu" if not left else "lưu thiếu"
+                    # Notes describe the workbook, not a failed entry, so they must not
+                    # hold a finished section open.
+                    blocking = [p for p in problems if not p.startswith(NOTE_PREFIX)]
+                    result["sections"][title] = "đã lưu" if not blocking else "lưu thiếu"
+
             if problems:
                 result["problems"] += [f"{title}: {p}" for p in problems]
             print(f"      {result['sections'][title]}", flush=True)
@@ -2078,6 +2328,12 @@ def parse_args() -> argparse.Namespace:
                         "kể cả ngày khám. Ô đã có sẵn thì giữ nguyên.")
     p.add_argument("--force-exam-date", action="store_true",
                    help="Ghi đè cả khi hồ sơ đã có ngày khám khác (mặc định: giữ nguyên)")
+    p.add_argument("--separate-profile", action="store_true",
+                   help="Dùng cửa sổ Chrome riêng biệt qua Playwright (không bao giờ cướp focus)")
+    p.add_argument("--hide-browser", action="store_true", default=True,
+                   help="Ẩn cửa sổ Chrome xuống nền để không bao giờ chiếm focus hay chuột")
+    p.add_argument("--no-hide-browser", dest="hide_browser", action="store_false",
+                   help="Không ẩn cửa sổ Chrome")
     p.add_argument("--dry-run", action="store_true", help="Điền nhưng không bấm lưu")
     p.add_argument("--check-file", action="store_true",
                    help="Chỉ đọc file Excel và in ra, không mở trình duyệt")
@@ -2140,9 +2396,35 @@ def main() -> None:
     print(f"Khoảng ngày khám: {args.exam_from} - {args.exam_to}")
     print(f"Sẽ xử lý {len(records)} hồ sơ" + ("  [DRY RUN]" if args.dry_run else ""))
 
+    if args.separate_profile:
+        from playwright.sync_api import sync_playwright
+        from app.importer import CHROME_PROFILE_DIR, Importer
+        os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                CHROME_PROFILE_DIR,
+                headless=False,
+                channel="chrome",
+                viewport=None,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            driver = Importer(page, age_group="M2")
+            if not driver.wait_for_login():
+                print("Hết thời gian chờ đăng nhập trên Chrome.")
+                return
+            filler = ClinicalFiller(driver, args.exam_from, args.exam_to, dry_run=args.dry_run)
+            _run_batch(filler, records, ids, args)
+        return
+
+    if args.hide_browser:
+        subprocess.run(["osascript", "-e", 'tell application "System Events" to set visible of process "Google Chrome" to false'], capture_output=True)
+
     driver = AppleScriptImporter(dry_run=args.dry_run, age_group="M2")
     filler = ClinicalFiller(driver, args.exam_from, args.exam_to, dry_run=args.dry_run)
+    _run_batch(filler, records, ids, args)
 
+
+def _run_batch(filler: ClinicalFiller, records: List[Dict], ids: Optional[Dict], args: argparse.Namespace) -> None:
     results, started = [], time.time()
     for i, r in enumerate(records, 1):
         print(f"\n[{i}/{len(records)}] TT{r['stt']} {r['name']} ({r['cccd']})", flush=True)

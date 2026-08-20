@@ -675,3 +675,127 @@ phần.
   Closes any open form/popups and returns the browser state to the list grid.
 * **`python3 scripts/capture_chrome.py`**:
   Saves a screenshot of Google Chrome.
+
+### 0j. Luồng API — nhập thẳng qua backend, không qua giao diện
+
+Dựng ngày 20/08/2026 cho `data/TH Bạch Đằng_MAU AI NHAP LIEU  KSK .xlsx` (270 em).
+Mã nguồn ở `tools/medinet_api/`. Kết quả: **270/270 khớp hoàn toàn với Excel** sau khi
+đối chiếu lại cả 5 mục. Nhanh hơn giao diện khoảng **60 lần** (270 em ≈ 6 phút/mục so
+với ~150 giây **mỗi em**), và không còn cả một lớp lỗi: hộp ICD không mở, number box
+không commit, bảng tiêm chủng quá giờ, biểu đồ răng lưu hụt.
+
+**Endpoint của từng mục** (`BASE = https://be-qlskcd.medinet.org.vn/api/services/app`):
+
+| Mục | Đọc | Ghi |
+|---|---|---|
+| Tiền sử | `FormViewer/FormViewerDataByRecord?form_id=1000103` → `result.data.formData[0]` | `DRViewerUtility/ActionWithParamIdAndReturnOutput?StoreName=KSKD18_TTHC_TienSu_Set&labelactionId=1001330` |
+| Khám lâm sàng | `DRViewer/ExecuteStoreWithParamAndDatasource?dataSourceId=97&store=KSKD18_ThongTinKham_Get` | cùng endpoint, `StoreName=KSKD18_ThongTinKham_Set&labelactionId=1001333` |
+| Kết luận | `...store=KSKDK_KetLuanKham_Get` | `StoreName=KSKDK_KetLuanKham_Set&labelactionId=1001336` |
+| Tâm thần ADHD | `DRViewer/PostData?id=1002346` + `TabOptions{formId:1000278, NhomCauHoiCode:GiamChuY_6_18Tuoi}` | `FormViewer/FormToDataBaseUpdate?form_id=1000278&tab_id=4166` |
+| Tâm thần Phổ tự kỷ | như trên với `formId:1000283, NhomCauHoiCode:PhoTuKy_6_11Tuoi` | `...?form_id=1000283&tab_id=4166` |
+| Tiêm chủng (bảng con) | `DRViewer/PostData?id=1002141` | nằm trong `KSKD18_TiemChung_Json` của payload Tiền sử |
+
+Body của `ActionWith...` là **mảng `{"Varible","Value"}`** (chữ V hoa); body của
+`FormToDataBaseUpdate` là **dict**. Tra mã ICD: `DRReportService/HF_ExecuteServiceWithParam
+?serviceId=1000291` với `SearchValue`, trả `result.data[{Id,Name}]`.
+
+**THỨ TỰ GHI LÀ BẮT BUỘC — đo được, không phải quy ước:**
+```
+Tiền sử  →  Tâm thần  →  Khám lâm sàng  →  Kết luận
+```
+Ghi Tiền sử **đặt lại về `false` các boolean của Khám lâm sàng mà payload của nó không
+mang theo** — `TieuHoa_ChuaPhatHienBatThuong` và `ThanTietNieu_ChanDoanSoBo`. Chạy lâm
+sàng trước rồi Tiền sử sau đã xoá ô "tiêu hoá" của **8/8 em trong mẫu kiểm**. Chiều
+ngược lại an toàn: ghi lâm sàng không đụng Tiền sử. Kết luận phải cuối vì Medinet suy
+mục *2. Bệnh, tật cần lưu ý* từ chẩn đoán **đã lưu**.
+
+**ĐỐI CHIẾU PHẢI LÀM SAU KHI GHI XONG TẤT CẢ, KHÔNG KIỂM RỜI TỪNG MỤC.**
+Kiểm ngay sau mỗi mục chỉ soi các trường của chính mục đó, nên nó **không nhìn thấy
+mục vừa ghi đã phá mục khác**. Lượt Tiền sử báo "270/270 khớp" hoàn toàn thật trong khi
+đang xoá dữ liệu lâm sàng của gần như cả danh sách. Dùng `verify_all5.py`.
+
+**Bẫy đã mất công tìm ra:**
+* **Token hết hạn sau vài phút.** Backend trả HTTP 200 kèm `unAuthorizedRequest: true`
+  và `"Current user did not login"`. Nếu chỉ đếm số dòng trả về thì đọc thành "em này
+  không có hồ sơ" và **ghi sạch cả danh sách thành not_found**. `medapi` ném
+  `Unauthorized` riêng, runner tự lấy lại token (`refresh_token()`) rồi thử lại; hai
+  lần liên tiếp hỏng thì **dừng hẳn**, không bao giờ hạ xuống thành "không tìm thấy".
+* **Đừng viết lại logic diễn giải của dự án.** Tôi tự viết lại phần đọc ô Có/Không và
+  dùng nhầm `is_no_finding()` (dành cho ô lâm sàng) thay vì `is_no()`, nên `"Không"`
+  bị ghi thành `"Có"` — và bước đối chiếu **dùng chung hàm sai đó nên báo là khớp**.
+  Import `is_no`, `medinet_san_khoa`, `medinet_tooth_condition` từ `app.clinical`.
+* **Đối chiếu bằng id không bắt được lỗi diễn giải**, chỉ bắt được lỗi truyền dữ liệu.
+  `readback.py` in ra **nhãn chữ** cạnh giá trị Excel để soi bằng mắt — đó là thứ đã
+  phát hiện `"Không"` thành `"Có"`.
+* **Nhãn đáp án trùng nhau giữa các bộ câu hỏi**: `Thỉnh thoảng` là 25 ở bộ 1000280 và
+  52 ở bộ 1000286. Mỗi tab phải có bảng riêng; bảng chung sẽ chọn nhầm id.
+  ADHD dùng {51,52,53}, Phổ tự kỷ dùng {54,55,56,57}.
+* **Mã bộ câu hỏi tự kỷ phụ thuộc tuổi** (`PhoTuKy_6_11Tuoi`). File Bạch Đằng toàn em
+  6–11 tuổi; file có em 12–18 phải **dò lại mã**, đừng giả định.
+* **API dùng dấu chấm thập phân** (`144.3`), khác giao diện vốn đòi dấu phẩy.
+* **Quét mã ICD phải phủ CẢ 6 khối nội khoa**, không chỉ mắt/TMH/răng/tâm thần —
+  thiếu `K40.9` ở cột `than_tiet_nieu` làm TT198 hỏng.
+* Bắt payload thật bằng cách chèn `<script>` vào page world (`tap.js`), vì JS chạy qua
+  Apple Events ở isolated world không hook được `fetch`/`XHR` của Angular. Tabpanel
+  **giữ cả hai tab trong DOM**, nên phải lọc nút theo nhánh không `aria-hidden` mới
+  bấm đúng nút Lưu của tab đang hiện.
+
+### 0k. Đợt 20/08/2026 — TH Bến Cảng xong, TH Bạch Đằng xong, và các lỗi đã sửa trong code
+
+**TH Bến Cảng — `data/TH BEN CANG-AI NHẬP LIỆU KQ.xlsx` — HOÀN TẤT**
+29/29 em nhập đủ 5 mục, mỗi mục đều nạp lại trang đọc ngược xác nhận. Chạy qua giao
+diện. Mã ICD nhóm `F90` được người dùng chốt thành `F90.0`, đã sửa ô `AV6` trong file
+nguồn (bản sao lưu `...backup-20260811.xlsx`). Log từng em ở `logs_bencang/`.
+
+**TH Bạch Đằng — `data/TH Bạch Đằng_MAU AI NHAP LIEU  KSK .xlsx` — HOÀN TẤT**
+270/270 em, **cả 5 mục**, đối chiếu lại toàn bộ sau khi ghi xong: **0 sai**.
+Nhập bằng luồng API (mục 0j). Đã sửa **603 chỗ sai trên 183/270 em**: 325 chỗ ở Kết
+luận, 237 mã ICD chẩn đoán, 32 ô Sản khoa, còn lại số đo và tiêm chủng.
+Ba mã ICD do người dùng quyết, lưu kèm lý do ở `tools/medinet_api/icd_alias_note.json`:
+`E66→E66.0`, `F66→F90.0`, `H62.6→H52.6` (mã cuối là sửa lỗi gõ nhầm 5 thành 6 —
+đừng dùng F52.6, đó là mã rối loạn tình dục, sai hoàn toàn với hồ sơ trẻ tiểu học).
+
+**Các lỗi đã sửa trong `app/clinical.py` và `app/importer.py`:**
+
+* **`__mx.type()` bị hồi quy, phá toàn bộ hộp chọn lấy dữ liệu từ máy chủ.** Bản chưa
+  commit đã thay `el.focus()` bằng sự kiện focus giả và thêm `focusout`+`blur` cuối
+  hàm — blur đóng danh sách gợi ý ngay sau khi gõ, nên **424 mã ICD** trong một đợt
+  270 em bị báo "không chọn được" mà **0 lần** nào báo "Medinet không có mã": danh sách
+  chưa bao giờ hiện ra. Đã khôi phục, và tách `typeField()` (kết thúc bằng `focusout`,
+  cho number/text box) khỏi `type()` (giữ focus, cho ICD và ô tìm kiếm trên lưới).
+  Hai hàm này **không thể gộp**: lookup phải giữ focus, number box chỉ commit khi
+  focusout.
+* **Bước nạp lại trang đọc ngược đã bị xoá khỏi `fill_sections`.** Đây là gốc của
+  chuỗi lỗi "Vui lòng nhập chiều cao (cm)" trên hồ sơ đã điền đủ: khi bỏ bước này,
+  thông báo lúc lưu thành quan toà duy nhất, mà **nó nói dối theo cả hai chiều** —
+  lưu thành công vẫn kêu thiếu (form rebind về trống), lưu hỏng vẫn im lặng. Đã khôi
+  phục nguyên văn bản đã commit. Tôi mất 5 lần chẩn đoán sai mới tìm ra; dấu hiệu đáng
+  lẽ phải chú ý sớm là **dòng lỗi lẽ ra phải có mà không có** (không hề thấy
+  `không nhập được chieu_cao`), nghĩa là lỗi nằm ở phía đọc kết quả chứ không phải ghi.
+* **`validation_messages()` tin cả node cũ.** Nay chỉ tin thông báo khi thực sự có ô
+  mang `.dx-invalid`; toast (lỗi từ máy chủ) thì luôn tin.
+* **Bảng tiêm chủng hết giờ giữa chừng.** Ngân sách cứng 90s cắt ngang vòng lặp và báo
+  các dòng chưa kịp tới là "chưa đặt được"; số dòng thiếu tỉ lệ thuận với độ trễ máy
+  chủ (4 dòng ở 170s, 19 ở 540s, 30 ở 850s) — là deadline chứ không phải lỗi so khớp.
+  Nay chờ theo tiến độ (`VACCINE_STALL_S=25`, trần `VACCINE_BUDGET_S=300`), nhịp tick
+  120→250ms, và **vòng lặp trong trang kiểm cờ dừng ở đầu mỗi nhịp** — trước đó đặt
+  `running=false` không dừng được nó.
+* **Chrome bị cướp focus khi đang nhập.** Đo từng thao tác AppleScript: `set URL of tab`
+  và `make new tab` kéo Chrome lên; `execute javascript`, đọc URL, `el.focus()`,
+  `location.assign` thì **không**. `goto()` nay luôn tìm tab bằng cách đọc URL rồi điều
+  hướng bằng `location.assign`; đường AppleScript chỉ còn là phương án cuối và **trả
+  lại app đang ở tiền cảnh**. Kèm `_settle_after_navigation()` chờ `readyState` xong.
+* **Chặn ghi vào hồ sơ của đợt khám khác.** Nhánh tra API sinh ra cho em *không có*
+  ngày khám, nhưng nó nhận mọi hồ sơ. Nay hồ sơ **có** ngày khám ngoài khoảng yêu cầu
+  thì dừng, báo `khac_dot_kham`. Test: `tests/test_exam_window_guard.py`.
+* **Ghi chú không còn bị tính là lỗi.** Excel ghi câu chữ vào ô chỉ có Có/Không thì
+  đánh dấu `NOTE_PREFIX` — vẫn hiện ra nhưng không làm mục bị xếp "lưu thiếu", vốn
+  khiến em đó **không bao giờ được đánh dấu xong** và bị chạy lại vô hạn.
+  Test: `tests/test_note_not_defect.py`.
+* **Lá chắn postMessage đổi sang danh sách cho phép.** Danh sách chặn cũ chỉ liệt kê
+  react-devtools/redux/webpack, nên Wappalyzer lọt qua và nhét 1995 byte dữ liệu của
+  nó vào `KhamRangJSON`. Nay chỉ nhận mảng (dạng biểu đồ răng gửi) hoặc `INIT_DATA`.
+  Lưu ý: backend **không** ghi trường đó từ payload rác, nên dữ liệu răng đã lưu không
+  bị hỏng — đây là phòng ngừa, không phải sửa hỏng.
+
+Test: `python3 -m unittest discover -s tests` → **61/61 OK**.

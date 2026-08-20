@@ -222,6 +222,8 @@ def load_records(path: str) -> List[Dict]:
     for row in range(FIRST_DATA_ROW, ws.max_row + 1):
         rec = {key: ws.cell(row, col).value for col, key in column_map.items()}
         rec["cccd"] = nfc(rec["cccd"])
+        if rec["cccd"].isdigit() and len(rec["cccd"]) < 12:
+            rec["cccd"] = rec["cccd"].zfill(12)
         rec["name"] = nfc(rec["name"])
         if not rec["cccd"]:
             continue
