@@ -28,11 +28,26 @@ def has_finding(r):
     return False
 
 
-def want(r):
-    """(DeNghi id, KetLuan_DeNghi html) the record should end up with."""
-    if not has_finding(r):
-        return BINH_THUONG, None
+def advice(r):
+    """The workbook's own recommendation, or "" when it says none."""
+    from app.clinical import is_no
     text = wb.nfc(r.get('de_nghi') or '')
+    return "" if (not text or is_no(text)) else text
+
+
+def want(r):
+    """(DeNghi id, KetLuan_DeNghi html) the record should end up with.
+
+    A finding in a clinical block is not the only thing that makes a child one to watch:
+    the examiner may record a real recommendation ("béo phì, tăng vận động") with the
+    condition itself written in the free-text Khám lâm sàng khác column, which Medinet
+    does not treat as a diagnosis. Judging by the clinical blocks alone concluded
+    "bình thường" for 38 students of TH Tăng Bạt Hổ who plainly were not, and left their
+    recommendation unwritten. Either signal is enough.
+    """
+    text = advice(r)
+    if not has_finding(r) and not text:
+        return BINH_THUONG, None
     return CO_NGUY_CO, (f"<p>{text}</p>" if text else None)
 
 

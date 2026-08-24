@@ -61,13 +61,27 @@ def refresh_token():
     return False
 
 
+# The headers the app itself sends. SessionSiteId as a *header* is load-bearing:
+# FormViewer/FormToDataBaseUpdate answers "Object reference not set to an instance of
+# an object." without it, and it does so even when the exact body the browser just sent
+# successfully is replayed -- which made the failure look like a body problem for a
+# long time. Passing SessionSiteId only in the query string is not enough.
+APP_HEADERS = {"Content-Type": "application/json", "Accept": "text/plain",
+               "X-Requested-With": "XMLHttpRequest", "SessionSiteId": "130",
+               "displaymode": "0"}
+
+
+def _headers():
+    h = ["-H", "Authorization: " + token()]
+    for k, v in APP_HEADERS.items():
+        h += ["-H", f"{k}: {v}"]
+    return h
+
+
 def _curl(url, body):
     p = subprocess.run(
-        ["curl", "-s", "-m", "90", "-X", "POST", url,
-         "-H", "Content-Type: application/json",
-         "-H", "Authorization: " + token(),
-         "-H", "Accept: application/json",
-         "-d", json.dumps(body, ensure_ascii=False)],
+        ["curl", "-s", "-m", "90", "-X", "POST", url] + _headers()
+        + ["-d", json.dumps(body, ensure_ascii=False)],
         capture_output=True, text=True)
     try:
         return _check_auth(json.loads(p.stdout))
@@ -108,9 +122,8 @@ M12_CODE = "KSKDK_DanhSach_KSK_M12"
 
 
 def _get(path):
-    p = subprocess.run(["curl", "-s", "-m", "60", BASE + path,
-                        "-H", "Authorization: " + token(),
-                        "-H", "Accept: application/json"], capture_output=True, text=True)
+    p = subprocess.run(["curl", "-s", "-m", "60", BASE + path] + _headers(),
+                       capture_output=True, text=True)
     try:
         return _check_auth(json.loads(p.stdout))
     except json.JSONDecodeError:
@@ -132,27 +145,34 @@ def m12_ids():
     return _M12["v"]
 
 
-def find_record(cccd: str):
-    """phieukhamId + cdId for one CCCD, with no date filter.
+def find_records(cccd: str):
+    """All phieukhamId/cdId candidates for one CCCD, with no date filter.
 
     The M12 screen makes Ngày khám a required filter, so a record without one cannot be
     listed there; the stored procedure behind it has no such rule.
     """
     ids = m12_ids()
     if not ids:
-        return None
+        return []
     rid, ssid = ids
     got = _curl(f"{BASE}/DRViewer/PostDataWithDataOutput?id={rid}&SessionSiteId={ssid}",
                 [{"varible": "KSKDK_DinhDanhCaNhan", "value": str(cccd)}])
     rows = ((got or {}).get("result") or {}).get("data") or []
+    out = []
     for row in rows:
         if str(row.get("DinhDanhCaNhan") or "").strip() != str(cccd):
             continue
         if not row.get("phieukhamId") or not row.get("cdId"):
             continue
-        return {"phieukhamId": str(row["phieukhamId"]), "cdId": str(row["cdId"]),
-                "name": row.get("HoTen"), "exam": row.get("NgayKham")}
-    return None
+        out.append({"phieukhamId": str(row["phieukhamId"]), "cdId": str(row["cdId"]),
+                    "name": row.get("HoTen"), "exam": row.get("NgayKham")})
+    return out
+
+
+def find_record(cccd: str):
+    """First matching record, retained for compatibility with the older runners."""
+    rows = find_records(cccd)
+    return rows[0] if rows else None
 
 
 FORM_IDS = {"tien_su": 1000103, "lam_sang": 1000104, "ket_luan": 1000105}

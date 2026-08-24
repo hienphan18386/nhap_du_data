@@ -363,8 +363,47 @@ class ClinicalFiller:
         """
         self.d.goto(url)
         deadline = time.time() + timeout_s
+        blank_since = None
+        blank_reloaded = False
         while time.time() < deadline:
             time.sleep(1.0)
+            # Chrome occasionally finishes location.assign() on a completely blank
+            # document while keeping the requested Medinet URL.  readyState is then
+            # already "complete", so waiting longer can never make a form marker
+            # appear.  A real reload recovers the app without losing the login or
+            # the marked tab.  Require several consecutive blank observations so a
+            # normal document swap is never reloaded mid-navigation.
+            page_state = self.js("""
+                (function(){
+                    var body = document.body;
+                    return {
+                        ready: document.readyState,
+                        chars: body ? (body.innerText || '').trim().length : 0,
+                        elements: body ? body.querySelectorAll('*').length : 0,
+                        appElements: (body && body.querySelector('app-root'))
+                            ? body.querySelector('app-root').querySelectorAll('*').length
+                            : -1
+                    };
+                })()
+            """) or {}
+            is_blank_complete = (page_state.get("ready") == "complete" and
+                                 page_state.get("chars", 0) < 20 and
+                                 (page_state.get("appElements") == 0 or
+                                  page_state.get("elements", 0) < 5))
+            if is_blank_complete and not blank_reloaded:
+                blank_since = blank_since or time.time()
+                if time.time() - blank_since >= 5.0:
+                    hard_goto = getattr(self.d, "hard_goto", None)
+                    if hard_goto:
+                        hard_goto(url)
+                    else:
+                        self.js("location.reload(); true")
+                    blank_reloaded = True
+                    blank_since = None
+                    time.sleep(1.0)
+                    continue
+            elif not is_blank_complete:
+                blank_since = None
             self.install_helpers()
             if ready_class is None:
                 if self.js("document.readyState") == "complete":
@@ -1079,7 +1118,7 @@ class ClinicalFiller:
         """One sub-tab of section 2: the evaluation date plus every question."""
         problems = []
         wanted = len([a for a in answers if nfc(a)])
-        if not self._wait(lambda: self.question_rows() >= wanted, 30):
+        if not self._wait(lambda: self.question_rows() >= wanted, 90):
             problems.append(f"bảng câu hỏi chỉ nạp được {self.question_rows()}/{wanted} dòng")
 
         if not self.set_datebox("NgayDanhGia", exam_date):

@@ -9,7 +9,9 @@ from app import ksk_workbook as wb
 from app.clinical import NHI_KHOA, medinet_tooth_condition
 import medapi
 
-TOOTH_STATUS = {"bình thường": 191, "sâu": 192, "trám sâu lại": 193, "trám tốt": 194}
+TOOTH_STATUS = {"bình thường": 191, "sâu": 192, "trám sâu lại": 193, "trám tốt": 194,
+                "mất do sâu": 195, "mất lý do khác": 196, "bít hố rãnh": 197,
+                "trụ, cầu,implant": 198, "chưa mọc": 220, "không ghi nhận": 221}
 
 
 def num(v):
@@ -73,6 +75,13 @@ def build(r, current):
         if v is not None:
             out[field] = v
 
+    # Free text "Khám lâm sàng khác". The Get store does not return this field, so it
+    # cannot be read back through the API -- it is written exactly as the UI writes it
+    # (raw workbook text) and has to be confirmed in the page itself.
+    khac = wb.nfc(r.get("kham_lam_sang_khac") or "")
+    if khac:
+        out["KhamLamSangKhac"] = khac
+
     # Teeth: the stored value is a list of {toothNumber, statusId, statusName}. Only the
     # teeth the workbook names are touched; every other tooth keeps what Medinet holds.
     cond = medinet_tooth_condition(r.get("tinh_trang_rang"))
@@ -93,7 +102,11 @@ def build(r, current):
                     by[n]["statusId"] = sid
                     by[n]["statusName"] = cond
                 else:
-                    problems.append(f"răng {n} không có trong biểu đồ")
+                    # The stored chart holds only the teeth Medinet has a record for --
+                    # TT7's had 23 of 32 -- so a tooth the workbook names may simply not
+                    # be there yet. Adding it is what clicking that tooth in the chart
+                    # does; refusing would drop a real finding.
+                    by[n] = {"toothNumber": n, "statusId": sid, "statusName": cond}
             out["KhamRangJSON"] = json.dumps(
                 sorted(by.values(), key=lambda x: int(x["toothNumber"])), ensure_ascii=False)
     return out, problems
@@ -128,6 +141,8 @@ def check(r, stored):
 
     for field, key in (("Mat_KhongKinh_MP", "mat_khong_kinh_mp"),
                        ("Mat_KhongKinh_MT", "mat_khong_kinh_mt"),
+                       ("Mat_CoKinh_MP", "mat_co_kinh_mp"),
+                       ("Mat_CoKinh_MT", "mat_co_kinh_mt"),
                        ("TMH_TaiTrai_NoiThuong", "tai_trai_noi_thuong"),
                        ("TMH_TaiTrai_NoiTham", "tai_trai_noi_tham"),
                        ("TMH_TaiPhai_NoiThuong", "tai_phai_noi_thuong"),

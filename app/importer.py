@@ -1977,7 +1977,7 @@ class AppleScriptImporter(Importer):
         front afterwards.
         """
         if self.run_js(f"location.assign({js_string(url)}); true") is True:
-            self._settle_after_navigation()
+            self._settle_after_navigation(url=url)
             return
 
         # No marked tab yet (the first navigation of a run) or the marker was lost.
@@ -1988,11 +1988,11 @@ class AppleScriptImporter(Importer):
 tell application "Google Chrome"
     repeat with w in windows
         repeat with t in tabs of w
-            if URL of t contains "{self.SITE}" then
-                try
+            try
+                if URL of t contains "{self.SITE}" then
                     return execute t javascript {self._as_string(marker_js)}
-                end try
-            end if
+                end if
+            end try
         end repeat
     end repeat
     return "{self.NO_TAB}"
@@ -2001,12 +2001,65 @@ end tell
         self._tab_ref = None
         self._initial_activate_done = True
         if out and out not in (self.NO_TAB, "missing value", ""):
-            self._settle_after_navigation()
+            self._settle_after_navigation(url=url)
             return
 
         self._goto_last_resort(url)
 
-    def _settle_after_navigation(self, timeout_s: float = 20.0) -> None:
+    def _remark_tab_for_url(self, url: str) -> bool:
+        """Restore the marker Medinet clears while constructing a new document.
+
+        The navigation target is used as the selector, rather than merely choosing
+        the first Medinet tab, so this remains safe if another Medinet page is open.
+        """
+        marker_js = f"window.name = {js_string(self._tab_marker)}; true"
+        record_tokens = []
+        for key in ("phieukhamId", "cdId"):
+            needle = key + "="
+            if needle in url:
+                value = url.split(needle, 1)[1].split("&", 1)[0]
+                if value:
+                    record_tokens.append(needle + value)
+        record_match = " and ".join(
+            f"(URL of t) contains {self._as_string(token)}"
+            for token in record_tokens
+        )
+        target_condition = f"(URL of t) starts with {self._as_string(url)}"
+        if len(record_tokens) == 2:
+            # The tabpanel sometimes rewrites /1/ to /2/ (or vice versa) while
+            # retaining the same record. The record IDs are the stable identity.
+            target_condition = f"({target_condition}) or ({record_match})"
+        out = self._osascript_js(f"""
+tell application "Google Chrome"
+    set wi to 0
+    repeat with w in windows
+        set wi to wi + 1
+        set ti to 0
+        repeat with t in tabs of w
+            set ti to ti + 1
+            try
+                if {target_condition} then
+                    execute t javascript {self._as_string(marker_js)}
+                    return ((wi as text) & ":" & (ti as text))
+                end if
+            end try
+        end repeat
+    end repeat
+    return "{self.NO_TAB}"
+end tell
+""")
+        if not out or out == self.NO_TAB:
+            return False
+        try:
+            window_index, tab_index = out.split(":", 1)
+            self._tab_ref = (int(window_index), int(tab_index))
+            return True
+        except ValueError:
+            self._tab_ref = None
+            return False
+
+    def _settle_after_navigation(self, timeout_s: float = 20.0,
+                                 url: Optional[str] = None) -> None:
         """Wait for the page asked for to actually be loaded before returning.
 
         location.assign only starts a navigation; it returns immediately. The
@@ -2020,7 +2073,13 @@ end tell
         """
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if self.run_js("document.readyState") == "complete":
+            state = self.run_js("document.readyState")
+            if state is None and url:
+                # A new Medinet document clears window.name. Re-tag the tab selected
+                # by the exact navigation URL, then read it through the normal guard.
+                self._remark_tab_for_url(url)
+                state = self.run_js("document.readyState")
+            if state == "complete":
                 return
             time.sleep(0.4)
 
@@ -2076,7 +2135,11 @@ end if
 """)
         self._tab_ref = None
         self._initial_activate_done = True
-        self._settle_after_navigation()
+        self._settle_after_navigation(url=url)
+
+    def hard_goto(self, url: str) -> None:
+        """Force a real Chrome navigation for an Angular shell that stayed empty."""
+        self._goto_last_resort(url)
 
     def run_js(self, code: str):
         """Evaluate a JS expression in the medinet tab and JSON-decode the result.
@@ -2105,10 +2168,17 @@ end if
 
     def _osascript_js(self, script: str) -> Optional[str]:
         """Run an osascript that returns a JS result, raising if Chrome blocks JS."""
-        proc = self._osascript(script)
+        # osascript reading source from stdin does not load Chrome's scripting
+        # terminology on its own. Without this wrapper, `execute ... javascript`
+        # fails to compile and every DOM read silently looks like a missing tab.
+        wrapped = ('using terms from application "Google Chrome"\n' + script +
+                   '\nend using terms from')
+        proc = self._osascript(wrapped)
         err = (proc.stderr or "").strip()
         if err and ("javascript" in err.lower() and ("turned off" in err.lower() or "apple events" in err.lower())):
             raise AppleScriptJSDisabled(err)
+        if proc.returncode:
+            raise RuntimeError(err or f"osascript failed with code {proc.returncode}")
         return (proc.stdout or "").strip()
 
     def _run_js_on_known_tab(self, js: str) -> Optional[str]:
@@ -2149,14 +2219,14 @@ tell application "Google Chrome"
         set ti to 0
         repeat with t in tabs of w
             set ti to ti + 1
-            if URL of t contains "{self.SITE}" then
-                try
+            try
+                if URL of t contains "{self.SITE}" then
                     set res to execute t javascript {self._as_string(js)}
                     if res is not "{self.WRONG_TAB}" then
                         return ((wi as text) & ":" & (ti as text) & ":" & res)
                     end if
-                end try
-            end if
+                end if
+            end try
         end repeat
     end repeat
     return "{self.NO_TAB}"
